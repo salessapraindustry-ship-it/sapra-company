@@ -1,0 +1,9 @@
+requests
+gspread
+google-auth
+fastapi
+uvicorn
+anthropic
+gitpython
+playwright
+openpyxl

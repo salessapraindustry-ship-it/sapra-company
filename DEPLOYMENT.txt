@@ -1,0 +1,35 @@
+Each agent needs its own Railway worker service.
+Create 6 services in your Railway project, one per agent.
+
+For each service, set the start command to:
+
+CEO:
+  python ceo.py
+
+DEEP RESEARCHER:
+  python researcher.py
+
+BACKEND BUILDER:
+  python builder_backend.py
+
+FRONTEND BUILDER:
+  python builder_frontend.py
+
+B2B SELLER:
+  python seller_b2b.py
+
+FREELANCE SELLER:
+  python seller_freelance.py
+
+PRO FIXER:
+  python fixer.py
+
+ALL services need these environment variables:
+  ANTHROPIC_API_KEY=your_key
+  GOOGLE_SHEET_ID=your_sheet_id
+  GOOGLE_CREDENTIALS=your_service_account_json
+  GITHUB_TOKEN=your_github_token
+  GITHUB_USERNAME=your_github_username
+  GITHUB_REPO=username/repo-name
+  SERPER_API_KEY=your_serper_key
+  RAPIDAPI_KEY=your_rapidapi_key (optional)
