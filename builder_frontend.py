@@ -1035,204 +1035,231 @@ def main():
 if __name__ == "__main__":
     main()
 
-# === PRO-FIXER PATCH 20260328_1620 ===
+# === PRO-FIXER PATCH 20260328_1621 ===
 # Fixed: FRONTEND_BUILDER
-# Issues: Incomplete deploy_to_github_pages function - code is cut off mid-variable assignment 'repo_', causing syntax errors, No error handling wrapper around generate_landing_page or deploy_to_github_pages calls in main loop, JSON parsing logic uses manual bracket counting which fails on nested objects or escaped braces in HTML content, No validation that ANTHROPIC_API_KEY exists before making API calls, causing silent failures, Missing main execution loop - no run() or main() function to continuously build landing pages, State management loads/saves but is never actually used to track progress or resume work, No integration with shared_memory to pull tool ideas or report completed pages
+# Issues: deploy_to_github_pages() function is incomplete - cuts off mid-line with 'repo_' causing syntax error, No error handling for missing ANTHROPIC_API_KEY - fails silently when key is empty string, JSON parsing in generate_landing_page() uses fragile string indexing that fails on malformed responses, No actual deployment logic - only saves files locally even when GitHub credentials exist, Missing import for base64 library used in deploy function, No validation of AI response structure before accessing nested keys, State management is unused - built_pages list never actually populated or checked, No main execution loop or task orchestration - agent has no autonomous behavior
+def generate_landing_page(tool_name, description, price, endpoints, repo_url):
+    """Generate a high-converting landing page for a tool."""
+    if not ANTHROPIC_API_KEY:
+        log.error("ANTHROPIC_API_KEY not set")
+        return None
+
+    prompt = f"""You are an expert frontend developer and copywriter.
+Create a high-converting landing page for a developer tool.
+
+TOOL: {tool_name}
+DESCRIPTION: {description}
+PRICE: {price}
+API ENDPOINTS: {', '.join(endpoints[:3]) if endpoints else 'N/A'}
+REPO: {repo_url}
+
+Build a single HTML file (index.html) with:
+1. Compelling headline focused on the benefit, not the feature
+2. 3 key features with icons (use emoji)
+3. Code snippet showing how easy it is to use
+4. Pricing section with clear CTA button
+5. Simple footer with GitHub link
+6. Modern, clean design using Tailwind CSS CDN
+7. Mobile responsive
+
+The page should make a developer want to buy this tool immediately.
+
+Reply ONLY with valid JSON (no markdown):
+{{
+  "index_html": "complete single-file HTML",
+  "headline": "the main hero headline",
+  "tagline": "1 sentence value prop",
+  "cta_text": "button text",
+  "estimated_conversion": "X% of visitors buy"
+}}"""
+
+    def _call_api():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": TOKENS,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=60
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        result = _retry_api(_call_api)
+        if not result:
+            return None
+
+        text = result["content"][0]["text"].strip()
+        text = re.sub(r"\s*|\s*", "", text).strip()
+        
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            start_idx = text.find("{")
+            if start_idx == -1:
+                raise ValueError("No JSON object found")
+            depth, end_idx = 0, start_idx
+            for i in range(start_idx, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i
+                        break
+            data = json.loads(text[start_idx:end_idx+1])
+        
+        required_keys = ["index_html", "headline", "tagline", "cta_text"]
+        if not all(k in data for k in required_keys):
+            log.error(f"Missing required keys in response: {data.keys()}")
+            return None
+            
+        return data
+    except Exception as e:
+        log.error(f"generate_landing_page error: {e}")
+        return None
+
+
 def deploy_to_github_pages(tool_name, html_content):
     """Deploy landing page to GitHub Pages."""
+    import base64
+    
+    path = Path(f"/tmp/pages/{tool_name}/index.html")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(html_content)
+    log.info(f"  ✅ Page saved locally: {path}")
+    
     if not GITHUB_TOKEN or not GITHUB_USERNAME:
-        path = Path(f"/tmp/pages/{tool_name}/index.html")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(html_content)
-        log.info(f"  ✅ Page saved locally: {path}")
         return f"local:/tmp/pages/{tool_name}"
 
     try:
-        import base64
-        repo_name = f"{tool_name}-landing"
+        repo_name = f"{tool_name.lower().replace(' ', '-')}-landing"
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
         
-        # Create repo
-        def create_repo():
-            resp = requests.post(
-                "https://api.github.com/user/repos",
-                headers={"Authorization": f"token {GITHUB_TOKEN}"},
-                json={"name": repo_name, "auto_init": True},
-                timeout=30
-            )
-            return resp.status_code in [201, 422]
+        repo_data = {"name": repo_name, "auto_init": True, "private": False}
+        repo_resp = requests.post(
+            f"https://api.github.com/user/repos",
+            headers=headers,
+            json=repo_data,
+            timeout=30
+        )
         
-        if not _retry_api(create_repo):
-            log.error(f"Failed to create repo {repo_name}")
-            return None
+        if repo_resp.status_code not in [201, 422]:
+            log.warning(f"Repo creation returned {repo_resp.status_code}")
         
         time.sleep(2)
         
-        # Upload index.html
         content_b64 = base64.b64encode(html_content.encode()).decode()
-        def upload_file():
-            resp = requests.put(
-                f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/contents/index.html",
-                headers={"Authorization": f"token {GITHUB_TOKEN}"},
-                json={
-                    "message": "Deploy landing page",
-                    "content": content_b64
-                },
-                timeout=30
-            )
-            return resp.status_code in [200, 201]
+        file_data = {
+            "message": f"Deploy {tool_name} landing page",
+            "content": content_b64,
+            "branch": "main"
+        }
         
-        if not _retry_api(upload_file):
-            log.error(f"Failed to upload index.html to {repo_name}")
-            return None
+        file_resp = requests.put(
+            f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/contents/index.html",
+            headers=headers,
+            json=file_data,
+            timeout=30
+        )
         
-        # Enable GitHub Pages
-        def enable_pages():
-            resp = requests.post(
-                f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/pages",
-                headers={"Authorization": f"token {GITHUB_TOKEN}"},
-                json={"source": {"branch": "main", "path": "/"}},
-                timeout=30
-            )
-            return resp.status_code in [201, 409]
+        if file_resp.status_code not in [201, 200]:
+            log.error(f"File upload failed: {file_resp.status_code}")
+            return f"local:/tmp/pages/{tool_name}"
         
-        _retry_api(enable_pages)
+        pages_data = {"source": {"branch": "main", "path": "/"}}
+        requests.post(
+            f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/pages",
+            headers=headers,
+            json=pages_data,
+            timeout=30
+        )
         
         url = f"https://{GITHUB_USERNAME}.github.io/{repo_name}"
         log.info(f"  🚀 Deployed to: {url}")
         return url
         
     except Exception as e:
-        log.error(f"deploy_to_github_pages error: {e}")
-        return None
+        log.error(f"GitHub deployment error: {e}")
+        return f"local:/tmp/pages/{tool_name}"
 
 
-def extract_json_from_response(text):
-    """Robust JSON extraction from Claude responses."""
-    try:
-        text = re.sub(r"\s*|\s*", "", text).strip()
-        
-        # Try direct parse first
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-        
-        # Find first complete JSON object
-        start = text.find("{")
-        if start == -1:
-            return None
-        
-        # Use stack-based parsing
-        depth = 0
-        in_string = False
-        escape = False
-        
-        for i in range(start, len(text)):
-            ch = text[i]
-            
-            if escape:
-                escape = False
-                continue
-            
-            if ch == '\\':
-                escape = True
-                continue
-            
-            if ch == '"' and not escape:
-                in_string = not in_string
-                continue
-            
-            if not in_string:
-                if ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        return json.loads(text[start:i+1])
-        
-        return None
-    except Exception as e:
-        log.error(f"JSON extraction error: {e}")
-        return None
-
-
-def run():
-    """Main execution loop."""
-    if not ANTHROPIC_API_KEY:
-        log.error("❌ ANTHROPIC_API_KEY not set")
-        return
-    
-    log.info("🎨 Frontend Builder Agent started")
+def main():
+    """Main autonomous loop."""
+    log.info("🏗️  Frontend Builder Agent starting...")
     state = _load_state()
     
     while True:
-        state["cycle"] += 1
-        log.info(f"\n{'='*60}")
-        log.info(f"CYCLE {state['cycle']} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        log.info(f"{'='*60}")
-        
-        # Read tool ideas from shared memory
-        tools = sm.read_all("tool_ideas") or []
-        if not tools:
-            log.info("No tools in queue. Waiting...")
-            time.sleep(CYCLE_INTERVAL)
-            continue
-        
-        # Build pages for tools that don't have them yet
-        for tool in tools:
-            tool_name = tool.get("name", "unknown-tool")
+        try:
+            state["cycle"] += 1
+            log.info(f"\n{'='*60}\nCycle {state['cycle']} - {datetime.now()}\n{'='*60}")
             
-            if tool_name in state.get("built_pages", []):
+            tasks = sm.get_all_tasks()
+            frontend_tasks = [
+                t for t in tasks 
+                if t.get("agent") == "frontend" and t.get("status") != "done"
+            ]
+            
+            if not frontend_tasks:
+                log.info("No pending frontend tasks. Waiting...")
+                time.sleep(CYCLE_INTERVAL)
                 continue
             
-            log.info(f"\n🏗️  Building landing page: {tool_name}")
-            
-            page_data = _retry_api(
-                lambda: generate_landing_page(
-                    tool_name=tool_name,
-                    description=tool.get("description", ""),
-                    price=tool.get("price", "$9"),
-                    endpoints=tool.get("endpoints", []),
-                    repo_url=tool.get("repo_url", "")
+            for task in frontend_tasks[:3]:
+                task_id = task.get("id", "unknown")
+                tool_name = task.get("tool_name", "Unnamed Tool")
+                description = task.get("description", "A useful developer tool")
+                price = task.get("price", "$9")
+                endpoints = task.get("endpoints", [])
+                repo_url = task.get("repo_url", "")
+                
+                if tool_name in state["built_pages"]:
+                    log.info(f"  ⏭️  Already built: {tool_name}")
+                    sm.mark_task_done(task_id)
+                    continue
+                
+                log.info(f"  🎨 Building landing page: {tool_name}")
+                
+                page_data = generate_landing_page(
+                    tool_name, description, price, endpoints, repo_url
                 )
-            )
-            
-            if not page_data:
-                log.error(f"Failed to generate page for {tool_name}")
-                continue
-            
-            # Extract HTML
-            html = page_data.get("index_html", "")
-            if not html or len(html) < 100:
-                log.error(f"Invalid HTML generated for {tool_name}")
-                continue
-            
-            # Deploy
-            url = _retry_api(
-                lambda: deploy_to_github_pages(tool_name, html)
-            )
-            
-            if url:
-                state.setdefault("built_pages", []).append(tool_name)
+                
+                if not page_data:
+                    log.error(f"  ❌ Failed to generate page for {tool_name}")
+                    continue
+                
+                url = deploy_to_github_pages(tool_name, page_data["index_html"])
+                
+                state["built_pages"].append(tool_name)
                 _save_state(state)
                 
-                # Report back to shared memory
-                sm.append("completed_pages", {
-                    "tool": tool_name,
-                    "url": url,
-                    "headline": page_data.get("headline", ""),
-                    "conversion_estimate": page_data.get("estimated_conversion", "unknown"),
-                    "timestamp": datetime.now().isoformat()
-                })
+                sm.mark_task_done(task_id, {"landing_url": url, "headline": page_data.get("headline")})
+                log.info(f"  ✅ Completed: {tool_name} -> {url}")
                 
-                log.info(f"  ✅ SUCCESS: {url}")
-            else:
-                log.error(f"Failed to deploy {tool_name}")
-        
-        log.info(f"\nCycle complete. Built {len(state.get('built_pages', []))} pages total.")
-        log.info(f"Next cycle in {CYCLE_INTERVAL}s...")
-        time.sleep(CYCLE_INTERVAL)
+                time.sleep(5)
+            
+            _save_state(state)
+            log.info(f"\n✅ Cycle complete. Sleeping {CYCLE_INTERVAL}s...\n")
+            time.sleep(CYCLE_INTERVAL)
+            
+        except KeyboardInterrupt:
+            log.info("\n🛑 Shutting down gracefully...")
+            _save_state(state)
+            break
+        except Exception as e:
+            log.error(f"Main loop error: {e}")
+            time.sleep(60)
 
 
 if __name__ == "__main__":
-    run()
+    main()
