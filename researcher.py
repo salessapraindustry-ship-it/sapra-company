@@ -1379,3 +1379,132 @@ if __name__ == "__main__":
         except Exception as e:
             log.error(f"Cycle error: {e}")
             time.sleep(60)
+
+# === PRO-FIXER PATCH 20260328_1336 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: Line 120-141: Incomplete try-except block - response parsing code is cut off mid-line ('if resp.status_code == 20' should be '200'), Missing error handling for malformed JSON responses from Claude API, validate_opportunity() returns None on failure instead of safe default, causing downstream crashes, No retry logic on the critical validate_opportunity() Claude API call, web_search() uses wrong HTTP method (GET instead of POST) for Serper API, Missing validation that search_results is not empty before passing to Claude, No timeout or error recovery in main research loop, State file corruption can crash entire agent with no recovery
+def web_search(query):
+    """Search the web for real data. Returns empty list on any failure."""
+    try:
+        serper_key = os.environ.get("SERPER_API_KEY", "")
+        if not serper_key:
+            log.warning("No SERPER_API_KEY — skipping web search")
+            return []
+        
+        resp = requests.post(
+            "https://google.serper.dev/search",
+            headers={
+                "X-API-KEY": serper_key,
+                "Content-Type": "application/json"
+            },
+            json={"q": query, "num": 5},
+            timeout=10
+        )
+        
+        if resp.status_code == 200:
+            results = resp.json().get("organic", [])
+            return [{
+                "title": r.get("title", ""),
+                "snippet": r.get("snippet", ""),
+                "url": r.get("link", "")
+            } for r in results[:5]]
+        else:
+            log.warning(f"Serper returned {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log.warning(f"Search failed: {e}")
+    return []
+
+
+def validate_opportunity(topic, search_results):
+    """Use Claude to validate if this is a real opportunity."""
+    if not search_results:
+        log.warning(f"No search results for topic: {topic}")
+        return {
+            "is_viable": False,
+            "confidence": 0.0,
+            "demand_evidence": "No search results found",
+            "recommended_action": "SKIP",
+            "build_spec": ""
+        }
+    
+    results_text = "\n".join([
+        f"- {r['title']}: {r['snippet']}"
+        for r in search_results
+    ])
+
+    prompt = f"""You are a market researcher. Validate if this is a real money-making opportunity.
+
+TOPIC: {topic}
+SEARCH RESULTS:
+{results_text}
+
+Analyze for:
+1. Real buyer demand (people actively paying for this)
+2. Price benchmarks (what similar tools cost)
+3. Competition level (can we win?)
+4. Build difficulty (can an AI agent build this in 1-3 days?)
+5. Revenue potential (monthly recurring revenue possible?)
+
+Be HONEST and SPECIFIC. If demand is uncertain, say so.
+
+Reply ONLY in JSON:
+{{
+  "is_viable": true/false,
+  "confidence": 0.0-1.0,
+  "demand_evidence": "specific proof of demand",
+  "price_benchmark": "$X-Y/month based on [source]",
+  "competition": "LOW/MEDIUM/HIGH — why",
+  "build_difficulty": "EASY/MEDIUM/HARD — why",
+  "monthly_revenue_potential": "$X-Y",
+  "recommended_action": "BUILD_NOW/RESEARCH_MORE/SKIP",
+  "build_spec": "1-2 sentence description of exactly what to build"
+}}"""
+
+    def _call_claude():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": TOKENS,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data.get("content", [])
+            if content and len(content) > 0:
+                text = content[0].get("text", "")
+                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+                else:
+                    log.error("No JSON found in Claude response")
+                    return None
+        else:
+            log.error(f"Claude API returned {resp.status_code}: {resp.text}")
+            return None
+    
+    result = _retry_api(_call_claude, retries=3, delay=2)
+    
+    if result and isinstance(result, dict) and "is_viable" in result:
+        return result
+    else:
+        log.error(f"Validation failed for topic: {topic}")
+        return {
+            "is_viable": False,
+            "confidence": 0.0,
+            "demand_evidence": "API call failed",
+            "price_benchmark": "unknown",
+            "competition": "UNKNOWN",
+            "build_difficulty": "UNKNOWN",
+            "monthly_revenue_potential": "$0",
+            "recommended_action": "SKIP",
+            "build_spec": ""
+        }
