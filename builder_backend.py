@@ -4406,3 +4406,153 @@ def deploy_to_github(tool_name, files):
             if filename != "description":
                 (tool_dir / filename).write_text(content)
         return f"local:/tmp/tools/{tool_name}"
+
+# === PRO-FIXER PATCH 20260328_1429 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() uses incorrect Anthropic API response parsing - tries to extract JSON from text but fails when JSON contains nested braces or special characters, deploy_to_github() function is incomplete - cuts off mid-implementation at line 'resp = requests.post(' which causes immediate crashes, No error handling for malformed JSON responses from Claude - the regex-based JSON extraction with depth counting fails on complex nested structures, Missing actual research context gathering - research_context parameter is passed but never populated from shared_memory or external sources, No validation of generated code before saving/deploying - malformed Python code from Claude gets written directly to files, TOKENS=2048 is too low for generating complete backend applications with FastAPI, requirements, and README, No fallback when GitHub deployment fails - tool is lost if deployment errors occur, Missing imports and incomplete function implementations cause immediate runtime failures
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+Reply with JSON inside  code fence. Escape all special characters properly:
+{{
+  "tool_name": "snake_case_name",
+  "description": "what this tool does in 1 sentence",
+  "main_py": "complete main.py code with proper escaping",
+  "requirements_txt": "package1\\npackage2\\n...",
+  "readme_md": "markdown README with usage examples",
+  "api_endpoints": ["GET /endpoint1", "POST /endpoint2"],
+  "suggested_price": "$X/month",
+  "deployment_cmd": "railway up or render deploy command"
+}}"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": 16000,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=120
+        )
+        if resp.status_code == 200:
+            text = resp.json()["content"][0]["text"].strip()
+            
+            json_match = re.search(r'\s*({.*?})\s*', text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                json_match = re.search(r'{.*}', text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                else:
+                    log.error("No JSON found in response")
+                    return None
+            
+            try:
+                result = json.loads(json_str)
+                
+                if "main_py" in result:
+                    import ast
+                    try:
+                        ast.parse(result["main_py"])
+                    except SyntaxError as e:
+                        log.error(f"Generated Python code has syntax errors: {e}")
+                        return None
+                
+                return result
+            except json.JSONDecodeError as e:
+                log.error(f"JSON decode error: {e}")
+                return None
+                
+    except Exception as e:
+        log.error(f"generate_backend_code error: {e}")
+    return None
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    tool_dir = Path(f"/tmp/tools/{tool_name}")
+    tool_dir.mkdir(parents=True, exist_ok=True)
+    
+    for filename, content in files.items():
+        try:
+            (tool_dir / filename).write_text(content)
+        except Exception as e:
+            log.error(f"Failed to write {filename}: {e}")
+            return None
+    
+    log.info(f"  ✅ Tool saved locally: {tool_dir}")
+    
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        return f"local:/tmp/tools/{tool_name}"
+
+    try:
+        repo_name = tool_name.replace('_', '-')
+        
+        resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json={
+                "name": repo_name,
+                "description": f"Backend tool: {tool_name}",
+                "private": False,
+                "auto_init": True
+            },
+            timeout=30
+        )
+        
+        if resp.status_code not in [200, 201]:
+            log.warning(f"GitHub repo creation failed: {resp.status_code} - {resp.text}")
+            return f"local:/tmp/tools/{tool_name}"
+        
+        repo_url = resp.json().get("html_url", "")
+        clone_url = resp.json().get("clone_url", "")
+        
+        os.chdir(tool_dir)
+        subprocess.run(["git", "init"], check=False, capture_output=True)
+        subprocess.run(["git", "add", "."], check=False, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], check=False, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], check=False, capture_output=True)
+        
+        auth_clone_url = clone_url.replace("https://", f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@")
+        subprocess.run(["git", "remote", "add", "origin", auth_clone_url], check=False, capture_output=True)
+        subprocess.run(["git", "push", "-u", "origin", "main", "--force"], check=False, capture_output=True)
+        
+        log.info(f"  ✅ Deployed to GitHub: {repo_url}")
+        return repo_url
+        
+    except Exception as e:
+        log.error(f"GitHub deployment error: {e}")
+        return f"local:/tmp/tools/{tool_name}"
+
+
+def gather_research_context(task_description):
+    """Gather relevant research context from shared memory."""
+    try:
+        research = sm.query(f"research relevant to: {task_description}", top_k=3)
+        if research:
+            return "\n".join([r.get('content', '') for r in research])
+    except Exception as e:
+        log.warning(f"Research gathering failed: {e}")
+    return "No specific research context available."
