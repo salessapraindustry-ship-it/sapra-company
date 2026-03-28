@@ -8038,3 +8038,281 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# === PRO-FIXER PATCH 20260328_1553 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() returns raw JSON strings with unescaped newlines and code blocks, causing JSON parsing failures, Claude API response parsing uses fragile string indexing that fails on non-JSON responses or when JSON is wrapped in markdown, deploy_to_github() function is incomplete - cuts off mid-request, leaving the deployment non-functional, No error handling for malformed Claude responses containing code blocks with special characters, TOKENS=2048 is insufficient for generating complete backend applications with FastAPI, requirements.txt, and README, No validation that generated code actually contains required fields before attempting deployment, Prompt asks Claude to put multi-line Python code inside JSON strings without explicit escaping instructions
+#!/usr/bin/env python3
+# ================================================================
+#  builder_backend.py — Backend Builder Agent (FIXED)
+#  Builds APIs, automation tools, data pipelines
+#  Deploys to Railway/Render automatically
+# ================================================================
+
+import os
+import re
+import json
+import time
+import logging
+import requests
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import shared_memory as sm
+except:
+    class sm:
+        @staticmethod
+        def store(k, v):
+            pass
+        @staticmethod
+        def retrieve(k):
+            return None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger(__name__)
+
+def _retry_api(fn, retries=3, delay=2):
+    """Retry any API call on failure."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt < retries - 1:
+                log.warning(f'API retry {attempt+1}/{retries}: {e}')
+                time.sleep(delay)
+            else:
+                log.error(f'API failed after {retries} attempts: {e}')
+                return None
+
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_USERNAME   = os.environ.get("GITHUB_USERNAME", "")
+MODEL             = "claude-sonnet-4-20250514"
+TOKENS            = 16000
+CYCLE_INTERVAL    = 1800
+
+state_file = "/tmp/backend_builder_state.json"
+
+
+def _load_state():
+    try:
+        with open(state_file) as f:
+            return json.load(f)
+    except Exception:
+        return {"cycle": 0, "built_tools": []}
+
+
+def _save_state(state):
+    try:
+        with open(state_file, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code using XML tags to avoid JSON escaping issues."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+Respond ONLY with XML tags containing the code. Do NOT wrap in JSON. Use this exact format:
+
+<tool_name>snake_case_name</tool_name>
+<description>what this tool does in 1 sentence</description>
+<main_py>
+from fastapi import FastAPI
+# ... complete working code here
+</main_py>
+<requirements_txt>
+fastapi
+uvicorn
+</requirements_txt>
+<readme_md>
+# Tool Name
+Usage instructions here
+</readme_md>
+<api_endpoints>
+GET /health
+POST /api/endpoint
+</api_endpoints>
+<suggested_price>$5/month</suggested_price>
+<deployment_cmd>railway up</deployment_cmd>
+
+IMPORTANT: Return ONLY the XML tags above. No markdown, no backticks, no JSON."""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": TOKENS,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=120
+        )
+        if resp.status_code == 200:
+            text = resp.json()["content"][0]["text"].strip()
+            
+            # Extract XML tags
+            def extract_tag(tag_name):
+                pattern = f"<{tag_name}>(.+?)</{tag_name}>"
+                match = re.search(pattern, text, re.DOTALL)
+                return match.group(1).strip() if match else ""
+            
+            result = {
+                "tool_name": extract_tag("tool_name"),
+                "description": extract_tag("description"),
+                "main_py": extract_tag("main_py"),
+                "requirements_txt": extract_tag("requirements_txt"),
+                "readme_md": extract_tag("readme_md"),
+                "api_endpoints": extract_tag("api_endpoints").split("\n"),
+                "suggested_price": extract_tag("suggested_price"),
+                "deployment_cmd": extract_tag("deployment_cmd")
+            }
+            
+            # Validate required fields
+            if not result["tool_name"] or not result["main_py"]:
+                log.error("Generated code missing required fields")
+                return None
+                
+            if len(result["main_py"]) < 100:
+                log.error("Generated main.py too short, likely incomplete")
+                return None
+                
+            return result
+    except Exception as e:
+        log.error(f"generate_backend_code error: {e}")
+    return None
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool (COMPLETE IMPLEMENTATION)."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        log.info(f"  ✅ Tool saved locally: {tool_dir}")
+        return f"local:/tmp/tools/{tool_name}"
+
+    try:
+        # Create GitHub repository
+        repo_data = {
+            "name": tool_name,
+            "description": files.get("description", "Auto-generated backend tool"),
+            "private": False,
+            "auto_init": False
+        }
+        
+        create_resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json=repo_data,
+            timeout=30
+        )
+        
+        if create_resp.status_code not in [200, 201]:
+            log.error(f"Failed to create repo: {create_resp.text}")
+            return None
+            
+        repo_url = create_resp.json()["html_url"]
+        clone_url = create_resp.json()["clone_url"]
+        
+        # Create local repo and push
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        
+        for filename, content in files.items():
+            if filename not in ["description"]:
+                (tool_dir / filename).write_text(content)
+        
+        # Git operations
+        subprocess.run(["git", "init"], cwd=tool_dir, check=True)
+        subprocess.run(["git", "add", "."], cwd=tool_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=tool_dir, check=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=tool_dir, check=True)
+        
+        # Add authentication to clone URL
+        auth_clone_url = clone_url.replace("https://", f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@")
+        subprocess.run(["git", "remote", "add", "origin", auth_clone_url], cwd=tool_dir, check=True)
+        subprocess.run(["git", "push", "-u", "origin", "main"], cwd=tool_dir, check=True)
+        
+        log.info(f"  ✅ Deployed to GitHub: {repo_url}")
+        return repo_url
+        
+    except subprocess.CalledProcessError as e:
+        log.error(f"Git command failed: {e}")
+        return None
+    except Exception as e:
+        log.error(f"deploy_to_github error: {e}")
+        return None
+
+
+def main():
+    """Main agent loop."""
+    log.info("🚀 Backend Builder Agent starting...")
+    state = _load_state()
+    
+    while True:
+        state["cycle"] += 1
+        log.info(f"\n{'='*60}")
+        log.info(f"🔄 Cycle {state['cycle']}")
+        
+        # Example task - in production, pull from task queue
+        task = "Build simple web scraping API"
+        research = "FastAPI with BeautifulSoup4, accepts URL param, returns JSON"
+        
+        log.info(f"📋 Building: {task}")
+        code = generate_backend_code(task, research)
+        
+        if code and code.get("tool_name"):
+            files = {
+                "main.py": code["main_py"],
+                "requirements.txt": code["requirements_txt"],
+                "README.md": code["readme_md"],
+                "description": code["description"]
+            }
+            
+            repo_url = deploy_to_github(code["tool_name"], files)
+            if repo_url:
+                state["built_tools"].append({
+                    "name": code["tool_name"],
+                    "url": repo_url,
+                    "timestamp": datetime.now().isoformat()
+                })
+                _save_state(state)
+                log.info(f"✅ Successfully built {code['tool_name']}")
+        else:
+            log.error("❌ Code generation failed")
+        
+        log.info(f"💤 Sleeping {CYCLE_INTERVAL}s...")
+        time.sleep(CYCLE_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
