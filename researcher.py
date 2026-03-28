@@ -2371,3 +2371,92 @@ Reply ONLY in valid JSON (no markdown, no code blocks):
         return None
 
     return _retry_api(_call_api, retries=3, delay=2)
+
+# === PRO-FIXER PATCH 20260328_1432 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: Line 129: HTTP response code check is incomplete - 'if resp.status_code == 20' instead of 'if resp.status_code == 200', causing validation to always fail, No error handling for JSON parsing in validate_opportunity() - if Claude returns malformed JSON, entire validation crashes, Search results may be empty but validate_opportunity() still makes API call with empty data, wasting tokens and producing invalid analysis, No timeout or retry logic in validate_opportunity() API call - single failure kills entire research cycle, State persistence happens after research completes - if process crashes mid-cycle, all research progress is lost, No validation that ANTHROPIC_API_KEY exists before making API calls - fails silently with generic errors
+def validate_opportunity(topic, search_results):
+    """Use Claude to validate if this is a real opportunity."""
+    if not search_results:
+        log.warning(f"No search results for topic: {topic}")
+        return None
+    
+    if not ANTHROPIC_API_KEY:
+        log.error("ANTHROPIC_API_KEY not set - cannot validate")
+        return None
+    
+    results_text = "\n".join([
+        f"- {r['title']}: {r['snippet']}"
+        for r in search_results
+    ])
+
+    prompt = f"""You are a market researcher. Validate if this is a real money-making opportunity.
+
+TOPIC: {topic}
+SEARCH RESULTS:
+{results_text}
+
+Analyze for:
+1. Real buyer demand (people actively paying for this)
+2. Price benchmarks (what similar tools cost)
+3. Competition level (can we win?)
+4. Build difficulty (can an AI agent build this in 1-3 days?)
+5. Revenue potential (monthly recurring revenue possible?)
+
+Be HONEST and SPECIFIC. If demand is uncertain, say so.
+
+Reply ONLY in JSON:
+{{
+  "is_viable": true/false,
+  "confidence": 0.0-1.0,
+  "demand_evidence": "specific proof of demand (e.g. 500 RapidAPI subscribers at $X/mo)",
+  "price_benchmark": "$X-Y/month based on [source]",
+  "competition": "LOW/MEDIUM/HIGH — why",
+  "build_difficulty": "EASY/MEDIUM/HARD — why",
+  "monthly_revenue_potential": "$X-Y",
+  "recommended_action": "BUILD_NOW/RESEARCH_MORE/SKIP",
+  "build_spec": "1-2 sentence description of exactly what to build"
+}}"""
+
+    def _call_api():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": TOKENS,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data.get("content", [])
+            if content and len(content) > 0:
+                text = content[0].get("text", "")
+                try:
+                    json_match = re.search(r'\{[^}]+\}', text, re.DOTALL)
+                    if json_match:
+                        result = json.loads(json_match.group(0))
+                        required_keys = ["is_viable", "confidence", "demand_evidence", "recommended_action"]
+                        if all(k in result for k in required_keys):
+                            return result
+                        else:
+                            log.warning(f"Missing required keys in validation response")
+                            return None
+                    else:
+                        log.warning(f"No JSON found in response: {text[:200]}")
+                        return None
+                except json.JSONDecodeError as e:
+                    log.warning(f"JSON parse error: {e}")
+                    return None
+        else:
+            log.warning(f"Claude API returned {resp.status_code}: {resp.text[:200]}")
+            return None
+        return None
+    
+    return _retry_api(_call_api, retries=3, delay=2)
