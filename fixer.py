@@ -31,10 +31,13 @@ log = logging.getLogger(__name__)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO       = os.environ.get("GITHUB_REPO", "")
+MONITOR_API_URL   = os.environ.get("MONITOR_API_URL",
+                        "https://monitor-api-production.up.railway.app")
+MONITOR_API_KEY   = os.environ.get("MONITOR_API_KEY", "sapra2026")
 
 FIXER_MODEL    = "claude-sonnet-4-5"
 FIXER_TOKENS   = 8000
-CYCLE_INTERVAL = 600
+CYCLE_INTERVAL = 900   # 15 min — staggered from CEO (15min) and researcher (25min)
 IMPROVE_DAYS   = 3
 
 AGENT_FILES = {
@@ -47,6 +50,45 @@ AGENT_FILES = {
 }
 
 state_file = "/tmp/fixer_state.json"
+
+
+# ================================================================
+#  MONITOR API — read real company data without hammering Sheets
+# ================================================================
+
+def _monitor_get(endpoint):
+    """Read from Monitor API — avoids Google Sheets quota."""
+    try:
+        resp = requests.get(
+            f"{MONITOR_API_URL}/{endpoint}",
+            params={"api_key": MONITOR_API_KEY},
+            timeout=15
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        log.warning(f"Monitor API {endpoint}: {resp.status_code}")
+    except Exception as e:
+        log.warning(f"Monitor API error: {e}")
+    return {}
+
+def get_company_status():
+    """Get full company status from monitor API."""
+    return _monitor_get("status")
+
+def get_all_tasks():
+    """Get tasks via monitor API — no Sheets quota."""
+    data = _monitor_get("tasks")
+    return data.get("tasks", [])
+
+def get_all_agents():
+    """Get agent statuses via monitor API."""
+    data = _monitor_get("agents")
+    return data.get("agents", [])
+
+def get_errors():
+    """Get error logs via monitor API."""
+    data = _monitor_get("errors")
+    return data.get("errors", [])
 
 
 def _load_state():
@@ -460,17 +502,24 @@ def run():
         log.info(f"{'='*60}")
 
         try:
-            agent_statuses = sm.get_all_agent_statuses()
-            all_tasks      = sm.get_all_tasks()
-            log.info(f"  Agents: {len(agent_statuses)} | Tasks: {len(all_tasks)}")
+            # Use Monitor API — avoids Google Sheets 429 quota errors
+            status         = get_company_status()
+            all_tasks      = get_all_tasks()
+            agent_statuses = get_all_agents()
+            error_logs     = get_errors()
 
-            # 1. Fix failed tasks — always
+            total_tasks  = status.get("tasks", {}).get("total", 0)
+            failed_count = status.get("tasks", {}).get("failed", 0)
+            log.info(f"  Agents: {len(agent_statuses)} | Tasks: {total_tasks} | Failed: {failed_count}")
+            log.info(f"  Errors in log: {len(error_logs)}")
+
+            # 1. Fix failed tasks using real task data
             fix_failed_tasks(all_tasks, state)
 
-            # 2. Monitor health
+            # 2. Monitor health using real agent data
             check_health(agent_statuses, all_tasks)
 
-            # 3. 3-day improvement cycle
+            # 3. 3-day improvement — pass real data
             last = state.get("last_improvement")
             due  = (not last or
                     datetime.now() - datetime.fromisoformat(last)
@@ -478,15 +527,16 @@ def run():
             if due and len(agent_statuses) >= 2:
                 improvement_cycle(agent_statuses, all_tasks, state)
 
-            # 4. Report status
+            # 4. Report via Sheets (write only — low quota usage)
             sm.report_status(
                 sm.AGENT_FIXER,
                 status       = "ACTIVE",
-                current_task = f"Cycle {state['cycle']} complete",
+                current_task = f"Cycle {state['cycle']} — monitoring via API",
                 cycles_done  = state["cycle"],
                 last_output  = (
                     f"Fixes: {len(state['fixes_applied'])} | "
-                    f"Improvements: {len(state['improvement_log'])}"
+                    f"Improvements: {len(state['improvement_log'])} | "
+                    f"Failed tasks seen: {failed_count}"
                 ),
                 score        = 10
             )
