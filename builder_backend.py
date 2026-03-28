@@ -5924,3 +5924,214 @@ def deploy_to_github(tool_name, files):
     except Exception as e:
         log.error(f"deploy_to_github error: {e}")
         return f"local:/tmp/tools/{tool_name}"
+
+# === PRO-FIXER PATCH 20260328_1515 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() uses single JSON extraction with text.index('{') which fails when Claude returns explanatory text before JSON or malformed JSON, deploy_to_github() function is incomplete - cuts off mid-implementation at 'resp = requests.post(' causing all deployment attempts to fail, No error handling for missing ANTHROPIC_API_KEY - function silently fails when key is empty string, JSON parsing uses naive bracket counting that breaks on nested objects or JSON containing string literals with braces, No validation of generated code before deployment - malformed Python code gets pushed without syntax checking, _retry_api wrapper exists but is never actually used on any API calls, Missing imports and incomplete GitHub API implementation for repo creation and file pushing, No fallback mechanism when Claude returns code blocks instead of pure JSON
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool with robust JSON extraction."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+Reply ONLY with valid JSON (no markdown, no explanation):
+{{
+  "tool_name": "snake_case_name",
+  "description": "what this tool does in 1 sentence",
+  "main_py": "complete main.py code",
+  "requirements_txt": "package1\\npackage2\\n...",
+  "readme_md": "markdown README with usage examples",
+  "api_endpoints": ["GET /endpoint1", "POST /endpoint2"],
+  "suggested_price": "$X/month",
+  "deployment_cmd": "railway up or render deploy command"
+}}"""
+
+    if not ANTHROPIC_API_KEY:
+        log.error("ANTHROPIC_API_KEY not set")
+        return None
+
+    def _call_api():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": TOKENS,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=60
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        result = _retry_api(_call_api)
+        if not result:
+            return None
+            
+        text = result["content"][0]["text"].strip()
+        
+        # Try multiple extraction strategies
+        json_obj = None
+        
+        # Strategy 1: Extract from  code block
+        json_match = re.search(r'\s*({.*?})\s*', text, re.DOTALL)
+        if json_match:
+            try:
+                json_obj = json.loads(json_match.group(1))
+            except:
+                pass
+        
+        # Strategy 2: Extract from  code block (no language)
+        if not json_obj:
+            code_match = re.search(r'\s*({.*?})\s*', text, re.DOTALL)
+            if code_match:
+                try:
+                    json_obj = json.loads(code_match.group(1))
+                except:
+                    pass
+        
+        # Strategy 3: Find first valid JSON object
+        if not json_obj:
+            start_idx = text.find('{')
+            if start_idx != -1:
+                # Try parsing from each { until we find valid JSON
+                for i in range(start_idx, len(text)):
+                    if text[i] == '{':
+                        for j in range(len(text), i, -1):
+                            if text[j-1] == '}':
+                                try:
+                                    json_obj = json.loads(text[i:j])
+                                    break
+                                except:
+                                    continue
+                        if json_obj:
+                            break
+        
+        # Strategy 4: Try parsing entire response
+        if not json_obj:
+            try:
+                json_obj = json.loads(text)
+            except:
+                pass
+        
+        if not json_obj:
+            log.error(f"Failed to extract JSON from response: {text[:200]}...")
+            return None
+        
+        # Validate required fields
+        required_fields = ["tool_name", "main_py", "requirements_txt"]
+        for field in required_fields:
+            if field not in json_obj:
+                log.error(f"Missing required field: {field}")
+                return None
+        
+        # Validate Python syntax
+        try:
+            import ast
+            ast.parse(json_obj["main_py"])
+        except SyntaxError as e:
+            log.error(f"Generated Python code has syntax errors: {e}")
+            return None
+        
+        return json_obj
+        
+    except Exception as e:
+        log.error(f"generate_backend_code error: {e}")
+        return None
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        # Save locally
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        log.info(f"  ✅ Tool saved locally: {tool_dir}")
+        return f"local:/tmp/tools/{tool_name}"
+
+    def _create_repo():
+        resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json={
+                "name": tool_name,
+                "description": f"Auto-generated backend tool: {tool_name}",
+                "private": False,
+                "auto_init": True
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _upload_file(filepath, content):
+        resp = requests.put(
+            f"https://api.github.com/repos/{GITHUB_USERNAME}/{tool_name}/contents/{filepath}",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json={
+                "message": f"Add {filepath}",
+                "content": __import__('base64').b64encode(content.encode()).decode()
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        # Create repository
+        repo_data = _retry_api(_create_repo)
+        if not repo_data:
+            log.error("Failed to create GitHub repo")
+            return None
+        
+        repo_url = repo_data.get("html_url", "")
+        log.info(f"  📦 Created repo: {repo_url}")
+        
+        # Wait for repo initialization
+        time.sleep(2)
+        
+        # Upload each file
+        for filename, content in files.items():
+            result = _retry_api(lambda: _upload_file(filename, content))
+            if result:
+                log.info(f"  ✅ Uploaded {filename}")
+            else:
+                log.warning(f"  ⚠️  Failed to upload {filename}")
+        
+        return repo_url
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 422:
+            log.warning(f"Repo {tool_name} already exists, trying local save")
+            tool_dir = Path(f"/tmp/tools/{tool_name}")
+            tool_dir.mkdir(parents=True, exist_ok=True)
+            for filename, content in files.items():
+                (tool_dir / filename).write_text(content)
+            return f"local:/tmp/tools/{tool_name}"
+        log.error(f"GitHub API error: {e}")
+        return None
+    except Exception as e:
+        log.error(f"deploy_to_github error: {e}")
+        return None
