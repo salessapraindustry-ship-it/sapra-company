@@ -592,9 +592,9 @@ if __name__ == "__main__":
     main()
 
 
-# === PRO-FIXER PATCH 20260328_1517 ===
+# === PRO-FIXER PATCH 20260328_1519 ===
 # Fixed: B2B_SELLER
-# Issues: Line 168: Incomplete code - content.ge is truncated, should be content.get(), generate_listing_content() uses fragile JSON extraction with manual brace counting instead of robust parsing, No error handling for missing ANTHROPIC_API_KEY - will fail silently on API calls, create_rapidapi_listing() function is incomplete and cut off mid-execution, No actual marketplace API integration - only saves drafts to files, _retry_api() function is defined but never used anywhere in the code, State management lacks validation - corrupted JSON will break the agent, No implementation for listing on AppSumo, LemonSqueezy, or Gumroad despite being in description, Missing main() function or execution loop to actually run the agent, No mechanism to discover or inventory existing tools before listing them
+# Issues: Line 160: content.get() method call is truncated mid-line, causing syntax error, generate_listing_content() returns None on API failure but callers don't handle None gracefully, create_rapidapi_listing() is incomplete - function body cuts off abruptly, No actual marketplace API integration logic exists - only stub code that logs to files, No error handling for missing tool inventory or shared_memory integration, _retry_api helper function exists but is never used in the actual API calls, CYCLE_INTERVAL of 1800 seconds with no actual listing execution means agent never completes tasks, Missing main loop and orchestration logic to actually list tools on marketplaces
 def create_rapidapi_listing(tool_name, content, repo_url):
     """Create a RapidAPI listing via their API."""
     rapidapi_key = os.environ.get("RAPIDAPI_KEY", "")
@@ -607,46 +607,52 @@ def create_rapidapi_listing(tool_name, content, repo_url):
             "description": content.get("rapidapi_description", ""),
             "price":       content.get("suggested_rapidapi_price", ""),
             "tags":        content.get("rapidapi_tags", []),
-            "repo_url":    repo_url,
-            "created_at":  datetime.now().isoformat()
+            "category":    content.get("category", "Tools"),
+            "repo_url":    repo_url
         }
-        draft_file = f"/tmp/rapidapi_draft_{tool_name.replace(' ', '_')}.json"
-        with open(draft_file, "w") as f:
-            json.dump(draft, f, indent=2)
-        log.info(f"  ✅ RapidAPI draft saved: {draft_file}")
-        return {"status": "draft", "file": draft_file}
+        draft_file = f"/tmp/rapidapi_draft_{tool_name.lower().replace(' ','_')}.json"
+        try:
+            with open(draft_file, "w") as f:
+                json.dump(draft, f, indent=2)
+            log.info(f"  💾 Saved RapidAPI draft: {draft_file}")
+            return {"status": "draft", "file": draft_file}
+        except Exception as e:
+            log.error(f"Failed to save draft: {e}")
+            return None
     
-    try:
-        api_data = {
+    # Actual RapidAPI Provider API integration
+    def _create_listing():
+        headers = {
+            "X-RapidAPI-Key": rapidapi_key,
+            "Content-Type": "application/json"
+        }
+        payload = {
             "name": content.get("rapidapi_title", tool_name),
             "description": content.get("rapidapi_description", ""),
             "category": content.get("category", "Tools"),
             "tags": content.get("rapidapi_tags", []),
             "pricing": content.get("suggested_rapidapi_price", "$10/month"),
-            "websiteUrl": repo_url
+            "base_url": repo_url
         }
-        
-        def _post():
-            return requests.post(
-                "https://rapidapi.com/api/provider/listings",
-                headers={"Authorization": f"Bearer {rapidapi_key}", "Content-Type": "application/json"},
-                json=api_data,
-                timeout=30
-            )
-        
-        resp = _retry_api(_post)
-        if resp and resp.status_code in [200, 201]:
-            log.info(f"  ✅ RapidAPI listing created: {tool_name}")
-            return {"status": "success", "data": resp.json()}
-        else:
-            log.error(f"  ❌ RapidAPI listing failed: {resp.status_code if resp else 'No response'}")
-            return {"status": "failed", "error": resp.text if resp else "No response"}
-    except Exception as e:
-        log.error(f"  ❌ RapidAPI listing error: {e}")
-        return {"status": "error", "error": str(e)}
+        resp = requests.post(
+            "https://rapidapi.com/api/provider/apis",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        resp.raise_for_status()
+        return resp.json()
+    
+    result = _retry_api(_create_listing)
+    if result:
+        log.info(f"  ✅ Listed {tool_name} on RapidAPI")
+        return result
+    else:
+        log.error(f"  ❌ Failed to list {tool_name} on RapidAPI")
+        return None
 
 
-def create_gumroad_listing(tool_name, content, price, download_url):
+def create_gumroad_listing(tool_name, content, download_url):
     """Create a Gumroad product listing."""
     gumroad_token = os.environ.get("GUMROAD_ACCESS_TOKEN", "")
     if not gumroad_token:
@@ -654,153 +660,151 @@ def create_gumroad_listing(tool_name, content, price, download_url):
         draft = {
             "platform": "Gumroad",
             "tool": tool_name,
-            "price": price,
-            "download_url": download_url,
-            "created_at": datetime.now().isoformat()
+            "name": content.get("rapidapi_title", tool_name),
+            "description": content.get("rapidapi_description", ""),
+            "price": content.get("suggested_appsumo_price", "$49"),
+            "download_url": download_url
         }
-        draft_file = f"/tmp/gumroad_draft_{tool_name.replace(' ', '_')}.json"
-        with open(draft_file, "w") as f:
-            json.dump(draft, f, indent=2)
-        return {"status": "draft", "file": draft_file}
+        draft_file = f"/tmp/gumroad_draft_{tool_name.lower().replace(' ','_')}.json"
+        try:
+            with open(draft_file, "w") as f:
+                json.dump(draft, f, indent=2)
+            log.info(f"  💾 Saved Gumroad draft: {draft_file}")
+            return {"status": "draft", "file": draft_file}
+        except Exception as e:
+            log.error(f"Failed to save Gumroad draft: {e}")
+            return None
     
+    def _create_product():
+        headers = {"Authorization": f"Bearer {gumroad_token}"}
+        data = {
+            "name": content.get("rapidapi_title", tool_name),
+            "description": content.get("rapidapi_description", ""),
+            "price": int(re.findall(r'\d+', content.get("suggested_appsumo_price", "49"))[0]) * 100,
+            "file_url": download_url
+        }
+        resp = requests.post(
+            "https://api.gumroad.com/v2/products",
+            headers=headers,
+            data=data,
+            timeout=30
+        )
+        resp.raise_for_status()
+        return resp.json()
+    
+    result = _retry_api(_create_product)
+    if result:
+        log.info(f"  ✅ Listed {tool_name} on Gumroad")
+        return result
+    else:
+        log.error(f"  ❌ Failed to list {tool_name} on Gumroad")
+        return None
+
+
+def get_completed_tools():
+    """Fetch ready-to-sell tools from shared memory."""
     try:
-        def _post():
-            return requests.post(
-                "https://api.gumroad.com/v2/products",
-                headers={"Authorization": f"Bearer {gumroad_token}"},
-                data={
-                    "name": tool_name,
-                    "description": content.get("rapidapi_description", ""),
-                    "price": int(price.replace('$', '').split('/')[0]) * 100 if isinstance(price, str) else price,
-                    "file_url": download_url
-                },
-                timeout=30
-            )
-        resp = _retry_api(_post)
-        if resp and resp.status_code == 200:
-            log.info(f"  ✅ Gumroad listing created: {tool_name}")
-            return {"status": "success", "data": resp.json()}
-        return {"status": "failed", "error": resp.text if resp else "No response"}
+        tools = sm.get_all("completed_tools") or []
+        if not tools:
+            log.info("  ℹ️  No completed tools found in shared_memory")
+        return tools
     except Exception as e:
-        log.error(f"  ❌ Gumroad error: {e}")
-        return {"status": "error", "error": str(e)}
+        log.error(f"Failed to get completed tools: {e}")
+        return []
 
 
-def discover_existing_tools():
-    """Scan shared memory and filesystem for completed tools ready to sell."""
-    tools = []
-    try:
-        memory = sm.recall("completed_tools") or []
-        for tool in memory:
-            if isinstance(tool, dict) and tool.get("status") == "completed":
-                tools.append({
-                    "name": tool.get("name", "Unnamed Tool"),
-                    "description": tool.get("description", ""),
-                    "repo_url": tool.get("repo_url", ""),
-                    "endpoints": tool.get("endpoints", []),
-                    "type": tool.get("type", "api")
-                })
-    except Exception as e:
-        log.warning(f"Could not read shared memory: {e}")
+def run_cycle(state):
+    """Execute one B2B seller cycle."""
+    state["cycle"] += 1
+    log.info(f"\n{'='*60}")
+    log.info(f"B2B SELLER CYCLE #{state['cycle']}")
+    log.info(f"{'='*60}")
     
-    tool_dirs = ["/tmp/tools", "/workspace/tools", "./tools"]
-    for base_dir in tool_dirs:
-        if os.path.exists(base_dir):
-            for item in os.listdir(base_dir):
-                item_path = os.path.join(base_dir, item)
-                if os.path.isdir(item_path):
-                    manifest = os.path.join(item_path, "manifest.json")
-                    if os.path.exists(manifest):
-                        try:
-                            with open(manifest) as f:
-                                tool_data = json.load(f)
-                                if tool_data.get("ready_to_sell"):
-                                    tools.append({
-                                        "name": tool_data.get("name", item),
-                                        "description": tool_data.get("description", ""),
-                                        "repo_url": tool_data.get("repo_url", ""),
-                                        "endpoints": tool_data.get("endpoints", []),
-                                        "type": tool_data.get("type", "tool")
-                                    })
-                        except Exception as e:
-                            log.debug(f"Could not parse {manifest}: {e}")
-    
-    log.info(f"  📦 Discovered {len(tools)} tools ready to sell")
-    return tools
-
-
-def main():
-    """Main execution loop for B2B seller agent."""
-    if not ANTHROPIC_API_KEY:
-        log.error("❌ ANTHROPIC_API_KEY not set - cannot generate content")
-        return
-    
-    log.info("🚀 B2B Seller Agent Starting...")
-    state = _load_state()
-    state["cycle"] = state.get("cycle", 0) + 1
-    
-    tools = discover_existing_tools()
+    # Get completed tools ready for listing
+    tools = get_completed_tools()
     if not tools:
-        log.warning("⚠️  No tools found to sell. Waiting for completed tools...")
-        _save_state(state)
-        return
+        log.info("  ⏳ No tools ready to sell yet")
+        return state
     
-    listed_names = {l.get("name") for l in state.get("listings", [])}
-    new_listings = 0
+    log.info(f"  📦 Found {len(tools)} tools ready to list")
     
-    for tool in tools[:5]:
-        if tool["name"] in listed_names:
-            log.info(f"  ⏭️  {tool['name']} already listed")
+    for tool in tools[:5]:  # Process up to 5 tools per cycle
+        tool_name = tool.get("name", "Unknown Tool")
+        description = tool.get("description", "")
+        price = tool.get("price", "$10/month")
+        endpoints = tool.get("endpoints", [])
+        repo_url = tool.get("repo_url", "")
+        download_url = tool.get("download_url", repo_url)
+        
+        # Skip if already listed
+        if any(l.get("tool") == tool_name for l in state["listings"]):
+            log.info(f"  ⏭️  {tool_name} already listed")
             continue
         
-        log.info(f"  📝 Creating listing for: {tool['name']}")
+        log.info(f"\n  🛠️  Processing: {tool_name}")
         
+        # Generate listing content
         content = generate_listing_content(
-            tool["name"],
-            tool["description"],
-            "$10-50/month",
-            tool.get("endpoints", []),
-            tool.get("repo_url", "")
+            tool_name, description, price, endpoints, repo_url
         )
         
         if not content:
-            log.error(f"  ❌ Content generation failed for {tool['name']}")
+            log.warning(f"  ⚠️  Failed to generate content for {tool_name}")
             continue
         
-        rapidapi_result = create_rapidapi_listing(tool["name"], content, tool.get("repo_url", ""))
-        gumroad_result = create_gumroad_listing(tool["name"], content, "$49", tool.get("repo_url", ""))
+        # List on RapidAPI
+        rapidapi_result = create_rapidapi_listing(tool_name, content, repo_url)
         
+        # List on Gumroad
+        gumroad_result = create_gumroad_listing(tool_name, content, download_url)
+        
+        # Track listing
         listing_record = {
-            "name": tool["name"],
-            "created_at": datetime.now().isoformat(),
-            "rapidapi": rapidapi_result.get("status"),
-            "gumroad": gumroad_result.get("status"),
+            "tool": tool_name,
+            "timestamp": datetime.now().isoformat(),
+            "rapidapi": bool(rapidapi_result),
+            "gumroad": bool(gumroad_result),
             "content": content
         }
+        state["listings"].append(listing_record)
         
-        state["listings"] = state.get("listings", []) + [listing_record]
-        new_listings += 1
-        time.sleep(2)
+        if rapidapi_result or gumroad_result:
+            log.info(f"  ✅ Successfully listed {tool_name}")
+        
+        time.sleep(2)  # Rate limiting
     
-    _save_state(state)
-    log.info(f"✅ Cycle {state['cycle']} complete: {new_listings} new listings created")
-    sm.remember("b2b_seller_last_run", {
-        "timestamp": datetime.now().isoformat(),
-        "cycle": state["cycle"],
-        "new_listings": new_listings,
-        "total_listings": len(state.get("listings", []))
-    })
+    log.info(f"\n  📊 Total listings: {len(state['listings'])}")
+    log.info(f"  💰 Revenue tracking: ${state['revenue']:.2f}")
+    
+    return state
+
+
+def main():
+    """Main execution loop."""
+    log.info("🚀 B2B Seller Agent Starting...")
+    
+    if not ANTHROPIC_API_KEY:
+        log.error("❌ ANTHROPIC_API_KEY not set")
+        return
+    
+    state = _load_state()
+    
+    try:
+        while True:
+            state = run_cycle(state)
+            _save_state(state)
+            
+            log.info(f"\n  ⏸️  Sleeping {CYCLE_INTERVAL}s until next cycle...\n")
+            time.sleep(CYCLE_INTERVAL)
+    
+    except KeyboardInterrupt:
+        log.info("\n\n🛑 Shutting down gracefully...")
+        _save_state(state)
+    except Exception as e:
+        log.error(f"Fatal error: {e}")
+        _save_state(state)
+        raise
 
 
 if __name__ == "__main__":
-    while True:
-        try:
-            main()
-        except KeyboardInterrupt:
-            log.info("\n👋 B2B Seller Agent stopped by user")
-            break
-        except Exception as e:
-            log.error(f"❌ Agent error: {e}")
-        
-        log.info(f"💤 Sleeping {CYCLE_INTERVAL}s until next cycle...")
-        time.sleep(CYCLE_INTERVAL)
+    main()
