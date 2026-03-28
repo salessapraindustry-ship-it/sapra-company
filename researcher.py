@@ -1808,3 +1808,151 @@ def run():
 
 if __name__ == "__main__":
     run()
+
+# === PRO-FIXER PATCH 20260328_1347 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: Line 148: Incomplete code - requests.post() call is cut off mid-line with 'if resp.status_code == 20' instead of 200, Missing JSON parsing and error handling for Claude API response in validate_opportunity(), No main() function or agent loop implementation - the file ends abruptly, Missing state persistence logic - _save_state() is called nowhere, No integration with shared_memory module despite importing it, Validation failures suggest the agent never actually runs or completes cycles, No error handling for malformed JSON responses from Claude, Missing cycle management and task queue processing
+def validate_opportunity(topic, search_results):
+    """Use Claude to validate if this is a real opportunity."""
+    results_text = "\n".join([
+        f"- {r['title']}: {r['snippet']}"
+        for r in search_results
+    ])
+
+    prompt = f"""You are a market researcher. Validate if this is a real money-making opportunity.
+
+TOPIC: {topic}
+SEARCH RESULTS:
+{results_text}
+
+Analyze for:
+1. Real buyer demand (people actively paying for this)
+2. Price benchmarks (what similar tools cost)
+3. Competition level (can we win?)
+4. Build difficulty (can an AI agent build this in 1-3 days?)
+5. Revenue potential (monthly recurring revenue possible?)
+
+Be HONEST and SPECIFIC. If demand is uncertain, say so.
+
+Reply ONLY in JSON:
+{{
+  "is_viable": true/false,
+  "confidence": 0.0-1.0,
+  "demand_evidence": "specific proof of demand",
+  "price_benchmark": "$X-Y/month based on [source]",
+  "competition": "LOW/MEDIUM/HIGH — why",
+  "build_difficulty": "EASY/MEDIUM/HARD — why",
+  "monthly_revenue_potential": "$X-Y",
+  "recommended_action": "BUILD_NOW/RESEARCH_MORE/SKIP",
+  "build_spec": "1-2 sentence description of exactly what to build"
+}}"""
+
+    def _api_call():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": TOKENS,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            text = data.get("content", [{}])[0].get("text", "")
+            json_match = re.search(r'\{.*\}', text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+        return None
+
+    result = _retry_api(_api_call)
+    if not result:
+        log.error(f"Validation failed for: {topic}")
+        return {
+            "is_viable": False,
+            "confidence": 0.0,
+            "recommended_action": "SKIP",
+            "error": "API call failed"
+        }
+    return result
+
+
+def research_topic(topic):
+    """Deep research on a topic with validation."""
+    log.info(f"Researching: {topic}")
+    
+    search_results = web_search(topic)
+    if not search_results:
+        log.warning(f"No search results for: {topic}")
+        return None
+    
+    validation = validate_opportunity(topic, search_results)
+    
+    return {
+        "topic": topic,
+        "timestamp": datetime.now().isoformat(),
+        "search_results": search_results,
+        "validation": validation,
+        "status": "completed"
+    }
+
+
+def process_research_tasks():
+    """Read tasks from shared memory and process them."""
+    tasks = sm.get_list("research_tasks") or []
+    completed = sm.get_list("research_completed") or []
+    
+    for task in tasks:
+        if task in completed:
+            continue
+            
+        log.info(f"Processing research task: {task}")
+        result = research_topic(task)
+        
+        if result and result.get("validation", {}).get("is_viable"):
+            sm.append_list("validated_opportunities", result)
+            log.info(f"✓ Validated opportunity: {task}")
+        else:
+            log.info(f"✗ Rejected: {task}")
+        
+        sm.append_list("research_completed", task)
+        sm.save()
+
+
+def autonomous_cycle():
+    """Single research cycle."""
+    state = _load_state()
+    state["cycle"] += 1
+    
+    log.info(f"=== RESEARCHER CYCLE {state['cycle']} ===")
+    
+    process_research_tasks()
+    
+    if state["cycle"] % 5 == 0:
+        opportunities = sm.get_list("validated_opportunities") or []
+        log.info(f"Total validated opportunities: {len(opportunities)}")
+    
+    _save_state(state)
+
+
+def main():
+    """Main autonomous loop."""
+    log.info("Deep Researcher Agent starting...")
+    log.info(f"Cycle interval: {CYCLE_INTERVAL}s ({CYCLE_INTERVAL/60:.1f} minutes)")
+    
+    while True:
+        try:
+            autonomous_cycle()
+        except Exception as e:
+            log.error(f"Cycle error: {e}")
+        
+        time.sleep(CYCLE_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
