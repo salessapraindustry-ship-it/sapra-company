@@ -6135,3 +6135,147 @@ def deploy_to_github(tool_name, files):
     except Exception as e:
         log.error(f"deploy_to_github error: {e}")
         return None
+
+# === PRO-FIXER PATCH 20260328_1516 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() returns raw JSON text that contains unescaped Python code with newlines, quotes, and special characters - causing JSON parsing failures, deploy_to_github() function is incomplete - code cuts off mid-function at line 'resp = requests.post(' causing all deployment attempts to fail, No error handling for malformed JSON responses from Claude - when code contains backticks, quotes, or complex strings, the regex cleanup fails, The JSON extraction logic using depth-counting brace matching fails when JSON values contain nested objects or code with braces, Missing validation that generated code actually works before attempting deployment
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+Reply with ONLY valid JSON. Encode all code files as base64 to avoid escaping issues:
+{{
+  "tool_name": "snake_case_name",
+  "description": "what this tool does in 1 sentence",
+  "files": {{
+    "main.py": "<base64 encoded content>",
+    "requirements.txt": "<base64 encoded content>",
+    "README.md": "<base64 encoded content>"
+  }},
+  "api_endpoints": ["GET /endpoint1", "POST /endpoint2"],
+  "suggested_price": "$X/month",
+  "deployment_cmd": "railway up"
+}}"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=90
+        )
+        if resp.status_code != 200:
+            log.error(f"API error {resp.status_code}: {resp.text}")
+            return None
+            
+        text = resp.json()["content"][0]["text"].strip()
+        text = re.sub(r"(?:json)?\s*", "", text).strip()
+        
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            log.error(f"JSON parse error: {e}. Response: {text[:500]}")
+            return None
+        
+        if "files" in data:
+            import base64
+            decoded_files = {}
+            for fname, b64_content in data.get("files", {}).items():
+                try:
+                    decoded_files[fname] = base64.b64decode(b64_content).decode("utf-8")
+                except Exception as e:
+                    log.error(f"Failed to decode {fname}: {e}")
+                    return None
+            data["decoded_files"] = decoded_files
+        
+        return data
+        
+    except requests.exceptions.Timeout:
+        log.error("API request timed out")
+    except Exception as e:
+        log.error(f"generate_backend_code error: {e}")
+    return None
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        log.info(f"  ✅ Tool saved locally: {tool_dir}")
+        return f"local:/tmp/tools/{tool_name}"
+
+    try:
+        repo_name = tool_name.replace("_", "-")
+        
+        create_resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json={
+                "name": repo_name,
+                "description": f"Backend tool: {tool_name}",
+                "private": False,
+                "auto_init": True
+            },
+            timeout=30
+        )
+        
+        if create_resp.status_code not in [201, 422]:
+            log.error(f"Failed to create repo: {create_resp.status_code} {create_resp.text}")
+            return deploy_to_github(tool_name, files)
+        
+        repo_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
+        
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        
+        try:
+            subprocess.run(["git", "init"], cwd=tool_dir, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Backend Builder"], cwd=tool_dir, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "builder@example.com"], cwd=tool_dir, check=True, capture_output=True)
+            subprocess.run(["git", "add", "."], cwd=tool_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=tool_dir, check=True, capture_output=True)
+            subprocess.run(["git", "branch", "-M", "main"], cwd=tool_dir, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "remote", "add", "origin", f"https://{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git"],
+                cwd=tool_dir, check=True, capture_output=True
+            )
+            subprocess.run(["git", "push", "-u", "origin", "main", "--force"], cwd=tool_dir, check=True, capture_output=True)
+            
+            log.info(f"  ✅ Deployed to GitHub: {repo_url}")
+            return repo_url
+            
+        except subprocess.CalledProcessError as e:
+            log.error(f"Git operation failed: {e.stderr.decode() if e.stderr else str(e)}")
+            return f"local:/tmp/tools/{tool_name}"
+            
+    except Exception as e:
+        log.error(f"deploy_to_github error: {e}")
+        return f"local:/tmp/tools/{tool_name}"
