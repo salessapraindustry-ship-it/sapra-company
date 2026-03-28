@@ -242,9 +242,16 @@ def run():
             "tasks":    sm.get_all_tasks(),
             "agents":   sm.get_all_agent_statuses(),
             "research": sm.get_latest_research(5),
-            "revenue":  sm.get_total_revenue(),
             "errors":   sm.get_agent_error_logs(20),
         }
+
+        # Get real revenue from payment channels
+        try:
+            import payments
+            revenue = payments.get_total_autonomous_revenue()
+        except Exception:
+            revenue = sm.get_total_revenue()
+        company_status["revenue"] = revenue
 
         revenue = company_status["revenue"]
         log.info(f"  💰 Total revenue: ${revenue:.2f}")
