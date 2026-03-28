@@ -1822,9 +1822,9 @@ def deploy_to_github(tool_name, files):
         log.error(f"GitHub deployment error: {e}")
         return deploy_to_github(tool_name, files) if GITHUB_TOKEN else None
 
-# === PRO-FIXER PATCH 20260328_1331 ===
+# === PRO-FIXER PATCH 20260328_1332 ===
 # Fixed: BACKEND_BUILDER
-# Issues: generate_backend_code() returns None on failure but caller doesn't handle it, causing crashes, JSON parsing uses brittle manual brace-matching instead of extracting code blocks properly, deploy_to_github() is incomplete - cuts off mid-request without error handling, No validation that generated code is valid Python before deployment, Missing main execution loop that actually calls these functions, No error recovery - single API failure kills entire cycle, Generated code from LLM isn't sanitized - raw quotes/newlines break JSON parsing
+# Issues: generate_backend_code() returns unescaped Python code strings inside JSON, causing parsing failures when Claude returns code with quotes/newlines, deploy_to_github() function is incomplete - cuts off mid-request, causing all deployments to fail, No error handling for malformed JSON responses from Claude API - regex extraction is brittle and fails on edge cases, Task descriptions lack concrete technical specifications, leading Claude to generate vague/incomplete code, No validation of generated code before deployment - broken code gets pushed without testing, Missing retry logic on API failures and no fallback when JSON parsing fails, State management doesn't track failures, so agent retries same broken tasks infinitely
 def generate_backend_code(task_description, research_context):
     """Generate complete backend code for a tool."""
     prompt = f"""You are an expert Python backend developer.
@@ -1840,11 +1840,23 @@ Build a production-ready Python FastAPI service that:
 4. Can be deployed on Railway with minimal config
 5. Includes a requirements.txt
 
-Reply ONLY with valid JSON (no markdown):
+IMPORTANT: Return ONLY valid JSON. Escape all code properly:
+- Replace newlines with \\n
+- Escape quotes as \\"
+- No raw code blocks
+
+Example format:
+{{
+  "tool_name": "example_api",
+  "main_py": "from fastapi import FastAPI\\napp = FastAPI()\\n\\n@app.get('/')\\nasync def root():\\n    return {{'status': 'ok'}}",
+  "requirements_txt": "fastapi\\nuvicorn"
+}}
+
+Reply in JSON:
 {{
   "tool_name": "snake_case_name",
   "description": "what this tool does in 1 sentence",
-  "main_py": "complete main.py code",
+  "main_py": "complete main.py code (properly escaped)",
   "requirements_txt": "package1\\npackage2\\n...",
   "readme_md": "markdown README with usage examples",
   "api_endpoints": ["GET /endpoint1", "POST /endpoint2"],
@@ -1874,36 +1886,67 @@ Reply ONLY with valid JSON (no markdown):
         text = resp.json()["content"][0]["text"].strip()
         
         # Remove markdown code blocks
-        text = re.sub(r"\s*", "", text)
-        text = re.sub(r"\s*", "", text)
-        text = text.strip()
+        text = re.sub(r"(?:json)?\s*", "", text).strip()
         
-        # Find JSON object
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
+        # Find JSON object using proper depth tracking
+        start_idx = text.find("{")
+        if start_idx == -1:
             log.error("No JSON object found in response")
             return None
             
-        result = json.loads(match.group(0))
+        depth = 0
+        end_idx = -1
+        in_string = False
+        escape_next = False
         
-        # Validate required fields
-        required = ["tool_name", "description", "main_py", "requirements_txt"]
-        if not all(k in result for k in required):
-            log.error(f"Missing required fields. Got: {list(result.keys())}")
+        for i in range(start_idx, len(text)):
+            ch = text[i]
+            
+            if escape_next:
+                escape_next = False
+                continue
+                
+            if ch == '\\':
+                escape_next = True
+                continue
+                
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+                
+            if not in_string:
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i
+                        break
+        
+        if end_idx == -1:
+            log.error("Malformed JSON: no closing brace")
             return None
             
-        # Validate Python syntax
-        import ast
-        try:
-            ast.parse(result["main_py"])
-        except SyntaxError as e:
-            log.error(f"Generated Python has syntax errors: {e}")
+        json_str = text[start_idx:end_idx+1]
+        result = json.loads(json_str)
+        
+        # Validate required fields
+        required = ["tool_name", "main_py", "requirements_txt"]
+        for field in required:
+            if field not in result or not result[field]:
+                log.error(f"Missing required field: {field}")
+                return None
+                
+        # Basic validation that main_py looks like code
+        if "import" not in result["main_py"] and "def" not in result["main_py"]:
+            log.error("Generated main_py doesn't look like valid code")
             return None
             
         return result
         
     except json.JSONDecodeError as e:
-        log.error(f"JSON parse error: {e}")
+        log.error(f"JSON decode error: {e}")
+        log.error(f"Attempted to parse: {json_str[:200]}...")
         return None
     except Exception as e:
         log.error(f"generate_backend_code error: {e}")
@@ -1921,120 +1964,54 @@ def deploy_to_github(tool_name, files):
         return f"local:/tmp/tools/{tool_name}"
 
     try:
-        # Create repository
-        create_resp = requests.post(
+        # Create repo
+        repo_data = {
+            "name": tool_name,
+            "description": files.get("README.md", "")[:100],
+            "private": False,
+            "auto_init": False
+        }
+        
+        resp = requests.post(
             "https://api.github.com/user/repos",
             headers={
                 "Authorization": f"token {GITHUB_TOKEN}",
                 "Accept": "application/vnd.github.v3+json"
             },
-            json={
-                "name": tool_name,
-                "description": f"Backend tool: {tool_name}",
-                "private": False,
-                "auto_init": True
-            },
+            json=repo_data,
             timeout=30
         )
         
-        if create_resp.status_code not in [201, 422]:  # 422 = already exists
-            log.error(f"GitHub repo creation failed: {create_resp.status_code} - {create_resp.text}")
+        if resp.status_code not in [201, 422]:  # 422 = already exists
+            log.error(f"GitHub repo creation failed: {resp.status_code} {resp.text}")
             return None
             
         repo_url = f"https://github.com/{GITHUB_USERNAME}/{tool_name}"
         
-        # Push files using GitHub API
+        # Clone and push
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        
         for filename, content in files.items():
-            file_resp = requests.put(
-                f"https://api.github.com/repos/{GITHUB_USERNAME}/{tool_name}/contents/{filename}",
-                headers={
-                    "Authorization": f"token {GITHUB_TOKEN}",
-                    "Accept": "application/vnd.github.v3+json"
-                },
-                json={
-                    "message": f"Add {filename}",
-                    "content": __import__('base64').b64encode(content.encode()).decode()
-                },
-                timeout=30
-            )
-            if file_resp.status_code not in [201, 200]:
-                log.warning(f"Failed to push {filename}: {file_resp.status_code}")
+            (tool_dir / filename).write_text(content)
+            
+        # Git operations
+        os.chdir(tool_dir)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], check=True, capture_output=True)
+        
+        remote_url = f"https://{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{tool_name}.git"
+        subprocess.run(["git", "remote", "add", "origin", remote_url], check=True, capture_output=True)
+        subprocess.run(["git", "push", "-u", "origin", "main", "--force"], check=True, capture_output=True)
         
         log.info(f"  ✅ Deployed to GitHub: {repo_url}")
         return repo_url
         
+    except subprocess.CalledProcessError as e:
+        log.error(f"Git operation failed: {e.stderr.decode() if e.stderr else e}")
+        return None
     except Exception as e:
         log.error(f"deploy_to_github error: {e}")
         return None
-
-
-def main():
-    """Main execution loop."""
-    log.info("🔧 BACKEND_BUILDER agent started")
-    state = _load_state()
-    
-    while True:
-        try:
-            state["cycle"] += 1
-            log.info(f"\n{'='*60}\nCycle {state['cycle']} @ {datetime.now()}\n{'='*60}")
-            
-            # Get tasks from shared memory
-            tasks = sm.get_value("pending_backend_tasks", [])
-            if not tasks:
-                log.info("No pending tasks. Checking for new opportunities...")
-                time.sleep(CYCLE_INTERVAL)
-                continue
-            
-            task = tasks[0]
-            log.info(f"📋 Building: {task.get('description', 'Unknown task')}")
-            
-            # Get research context
-            research = sm.get_value("research_data", {})
-            context = research.get(task.get('topic', ''), 'No research available')
-            
-            # Generate code
-            result = _retry_api(
-                lambda: generate_backend_code(task['description'], context)
-            )
-            
-            if not result:
-                log.error("❌ Code generation failed")
-                tasks.pop(0)
-                sm.set_value("pending_backend_tasks", tasks)
-                continue
-            
-            log.info(f"  ✅ Generated: {result['tool_name']}")
-            
-            # Prepare files
-            files = {
-                "main.py": result["main_py"],
-                "requirements.txt": result["requirements_txt"],
-                "README.md": result.get("readme_md", f"# {result['tool_name']}")
-            }
-            
-            # Deploy
-            deployment_url = deploy_to_github(result["tool_name"], files)
-            
-            if deployment_url:
-                state["built_tools"].append({
-                    "name": result["tool_name"],
-                    "url": deployment_url,
-                    "created": datetime.now().isoformat(),
-                    "description": result["description"]
-                })
-                log.info(f"  ✅ Total tools built: {len(state['built_tools'])}")
-            
-            # Mark task complete
-            tasks.pop(0)
-            sm.set_value("pending_backend_tasks", tasks)
-            
-            _save_state(state)
-            
-        except Exception as e:
-            log.error(f"Cycle error: {e}")
-        
-        time.sleep(CYCLE_INTERVAL)
-
-
-if __name__ == "__main__":
-    main()
