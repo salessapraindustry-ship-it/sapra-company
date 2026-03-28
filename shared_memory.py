@@ -7,12 +7,27 @@
 
 import json
 import os
+import time
 import logging
 from datetime import datetime
 
 log = logging.getLogger(__name__)
 
-SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID", "")
+TIMEOUT     = 10  # seconds for all sheet operations
+
+def _retry_sheet(fn, retries=3, delay=2):
+    """Retry Google Sheets operations on failure."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt < retries - 1:
+                log.warning(f"Sheet retry {attempt+1}/{retries}: {e}")
+                time.sleep(delay)
+            else:
+                log.error(f"Sheet operation failed after {retries} attempts: {e}")
+                return None
 
 # Task stages
 STAGE_PENDING    = "PENDING"
