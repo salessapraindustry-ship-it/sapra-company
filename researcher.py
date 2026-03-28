@@ -1123,3 +1123,136 @@ Reply ONLY in JSON:
             "recommended_action": "SKIP",
             "build_spec": "Exception during validation"
         }
+
+# === PRO-FIXER PATCH 20260328_1330 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: Line 133: HTTP response parsing is truncated mid-line - 'if resp.status_code == 20' should be 'if resp.status_code == 200', No retry wrapper around critical validate_opportunity() API call - web_search() has retries but validation doesn't, validate_opportunity() returns None on failure instead of a fail-safe dict, causing downstream JSON parsing errors, No error handling for malformed JSON responses from Claude API - raw text responses will crash json.loads(), Missing main event loop and CEO communication - agent never reads tasks from shared_memory or reports results back, CYCLE_INTERVAL defined but never used - no autonomous execution loop implemented, State persistence exists but researched_topics never prevents duplicate research, No validation that ANTHROPIC_API_KEY exists before making API calls
+def validate_opportunity(topic, search_results):
+    """Use Claude to validate if this is a real opportunity."""
+    if not ANTHROPIC_API_KEY:
+        log.error("ANTHROPIC_API_KEY not set")
+        return {"is_viable": False, "confidence": 0.0, "recommended_action": "SKIP", "demand_evidence": "API key missing"}
+    
+    results_text = "\n".join([
+        f"- {r['title']}: {r['snippet']}"
+        for r in search_results
+    ]) if search_results else "No search results available"
+
+    prompt = f"""You are a market researcher. Validate if this is a real money-making opportunity.
+
+TOPIC: {topic}
+SEARCH RESULTS:
+{results_text}
+
+Analyze for:
+1. Real buyer demand (people actively paying for this)
+2. Price benchmarks (what similar tools cost)
+3. Competition level (can we win?)
+4. Build difficulty (can an AI agent build this in 1-3 days?)
+5. Revenue potential (monthly recurring revenue possible?)
+
+Be HONEST and SPECIFIC. If demand is uncertain, say so.
+
+Reply ONLY in valid JSON:
+{{
+  "is_viable": true,
+  "confidence": 0.8,
+  "demand_evidence": "specific proof",
+  "price_benchmark": "$X-Y/month",
+  "competition": "LOW/MEDIUM/HIGH",
+  "build_difficulty": "EASY/MEDIUM/HARD",
+  "monthly_revenue_potential": "$X-Y",
+  "recommended_action": "BUILD_NOW",
+  "build_spec": "what to build"
+}}"""
+
+    def _call_api():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": TOKENS,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if resp.status_code == 200:
+            content = resp.json().get("content", [])
+            if content and len(content) > 0:
+                text = content[0].get("text", "")
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+        return None
+    
+    result = _retry_api(_call_api, retries=3, delay=2)
+    if result:
+        return result
+    else:
+        return {
+            "is_viable": False,
+            "confidence": 0.0,
+            "demand_evidence": "Validation API failed",
+            "price_benchmark": "Unknown",
+            "competition": "UNKNOWN",
+            "build_difficulty": "UNKNOWN",
+            "monthly_revenue_potential": "$0",
+            "recommended_action": "SKIP",
+            "build_spec": "Could not validate opportunity"
+        }
+
+
+def research_topic(topic):
+    """Full research pipeline: search + validate."""
+    log.info(f"Researching: {topic}")
+    search_results = web_search(topic)
+    if not search_results:
+        log.warning(f"No search results for: {topic}")
+    validation = validate_opportunity(topic, search_results)
+    return {
+        "topic": topic,
+        "search_results": search_results,
+        "validation": validation,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+def main():
+    """Autonomous research loop."""
+    if not ANTHROPIC_API_KEY:
+        log.error("ANTHROPIC_API_KEY required. Exiting.")
+        return
+    
+    state = _load_state()
+    log.info(f"Deep Researcher starting (cycle {state['cycle']})")
+    
+    while True:
+        try:
+            task = sm.get_task("DEEP_RESEARCHER")
+            if task:
+                topic = task.get("query", "")
+                if topic and topic not in state["researched_topics"]:
+                    result = research_topic(topic)
+                    state["researched_topics"].append(topic)
+                    state["cycle"] += 1
+                    _save_state(state)
+                    sm.write_result("DEEP_RESEARCHER", result)
+                    log.info(f"Completed research: {topic} (viable: {result['validation']['is_viable']})")
+                else:
+                    log.info(f"Skipping duplicate topic: {topic}")
+            time.sleep(10)
+        except KeyboardInterrupt:
+            log.info("Shutting down researcher...")
+            break
+        except Exception as e:
+            log.error(f"Research cycle error: {e}")
+            time.sleep(30)
+
+
+if __name__ == "__main__":
+    main()
