@@ -14,7 +14,11 @@ from datetime import datetime
 log = logging.getLogger(__name__)
 
 SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID", "")
-TIMEOUT     = 10  # seconds for all sheet operations
+TIMEOUT     = 10
+
+# Simple in-memory cache to avoid hitting Sheets quota
+_cache = {}
+_cache_ttl = 60  # seconds
 
 def _retry_sheet(fn, retries=3, delay=2):
     """Retry Google Sheets operations on failure."""
@@ -22,12 +26,28 @@ def _retry_sheet(fn, retries=3, delay=2):
         try:
             return fn()
         except Exception as e:
-            if attempt < retries - 1:
+            if "429" in str(e) or "Quota" in str(e):
+                wait = delay * (attempt + 2)
+                log.warning(f"Sheets quota hit — waiting {wait}s")
+                time.sleep(wait)
+            elif attempt < retries - 1:
                 log.warning(f"Sheet retry {attempt+1}/{retries}: {e}")
                 time.sleep(delay)
             else:
                 log.error(f"Sheet operation failed after {retries} attempts: {e}")
                 return None
+
+def _cached_read(cache_key, fn):
+    """Cache sheet reads for 60 seconds to avoid quota."""
+    now = time.time()
+    if cache_key in _cache:
+        data, ts = _cache[cache_key]
+        if now - ts < _cache_ttl:
+            return data
+    result = _retry_sheet(fn)
+    if result is not None:
+        _cache[cache_key] = (result, now)
+    return result or []
 
 # Task stages
 STAGE_PENDING    = "PENDING"
@@ -133,7 +153,7 @@ def get_my_tasks(agent_name):
         ws = _get_or_create_tab(sheet, "Tasks")
         if not ws:
             return []
-        records = ws.get_all_records()
+        records = _cached_read(f"tasks_{agent_name}", ws.get_all_records)
         return [
             r for r in records
             if r.get("assigned_to") == agent_name
@@ -177,7 +197,7 @@ def get_all_tasks():
         ws = _get_or_create_tab(sheet, "Tasks")
         if not ws:
             return []
-        return ws.get_all_records()
+        return _cached_read("all_tasks", ws.get_all_records)
     except Exception as e:
         log.error(f"get_all_tasks error: {e}")
         return []
@@ -227,7 +247,7 @@ def get_all_agent_statuses():
         ws = _get_or_create_tab(sheet, "Agent Status")
         if not ws:
             return []
-        return ws.get_all_records()
+        return _cached_read("agent_statuses", ws.get_all_records)
     except Exception as e:
         log.error(f"get_all_agent_statuses error: {e}")
         return []
