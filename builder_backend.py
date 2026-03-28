@@ -5758,3 +5758,169 @@ def deploy_to_github(tool_name, files):
     except Exception as e:
         log.error(f"deploy_to_github error: {e}")
         return None
+
+# === PRO-FIXER PATCH 20260328_1513 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() creates invalid JSON responses with unescaped Python code inside JSON strings, causing JSON parsing failures, The prompt asks Claude to put complete Python code files inside JSON string values without proper escaping (newlines, quotes, backslashes), deploy_to_github() function is incomplete - cuts off mid-request, never actually creates repo or pushes code, No error handling for JSON parsing failures when Claude returns malformed responses, The agent attempts to parse raw Python code blocks as JSON without validation or cleaning, Retry logic calls logging module imports inside the retry function instead of using passed logger, No fallback mechanism when JSON extraction fails - returns None and agent gives up on task
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+Provide your response in this EXACT format:
+
+TOOL_NAME: snake_case_name
+DESCRIPTION: One sentence description
+PRICE: $X/month
+ENDPOINTS: GET /endpoint1, POST /endpoint2
+DEPLOYMENT: railway up
+
+:main.py
+# Complete main.py code here
+
+
+text:requirements.txt
+fastapi
+uvicorn
+
+
+markdown:README.md
+# Tool Name
+Usage examples here
+"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": 4096,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=90
+        )
+        if resp.status_code != 200:
+            log.error(f"API error: {resp.status_code} - {resp.text}")
+            return None
+            
+        text = resp.json()["content"][0]["text"].strip()
+        
+        # Extract metadata
+        tool_name = re.search(r'TOOL_NAME:\s*([\w_]+)', text)
+        description = re.search(r'DESCRIPTION:\s*(.+?)(?:\n|$)', text)
+        price = re.search(r'PRICE:\s*(.+?)(?:\n|$)', text)
+        endpoints = re.search(r'ENDPOINTS:\s*(.+?)(?:\n|$)', text)
+        deployment = re.search(r'DEPLOYMENT:\s*(.+?)(?:\n|$)', text)
+        
+        if not tool_name:
+            log.error("Could not extract tool_name from response")
+            return None
+            
+        # Extract code blocks
+        code_blocks = {}
+        pattern = r'(?:(\w+):)?(\S+)?\n(.*?)'
+        for match in re.finditer(pattern, text, re.DOTALL):
+            lang = match.group(1) or 'text'
+            filename = match.group(2) or 'code.txt'
+            content = match.group(3).strip()
+            code_blocks[filename] = content
+        
+        if 'main.py' not in code_blocks:
+            log.error("No main.py found in response")
+            return None
+        
+        # Build structured result
+        result = {
+            "tool_name": tool_name.group(1),
+            "description": description.group(1).strip() if description else "Backend tool",
+            "main_py": code_blocks.get('main.py', ''),
+            "requirements_txt": code_blocks.get('requirements.txt', 'fastapi\nuvicorn'),
+            "readme_md": code_blocks.get('README.md', f"# {tool_name.group(1)}"),
+            "api_endpoints": endpoints.group(1).split(',') if endpoints else [],
+            "suggested_price": price.group(1).strip() if price else "$10/month",
+            "deployment_cmd": deployment.group(1).strip() if deployment else "railway up"
+        }
+        
+        return result
+        
+    except Exception as e:
+        log.error(f"generate_backend_code error: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+    return None
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    tool_dir = Path(f"/tmp/tools/{tool_name}")
+    tool_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save files locally first
+    for filename, content in files.items():
+        (tool_dir / filename).write_text(content)
+    log.info(f"  ✅ Tool saved locally: {tool_dir}")
+    
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        return f"local:/tmp/tools/{tool_name}"
+
+    try:
+        # Create GitHub repo
+        resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json={
+                "name": tool_name,
+                "description": files.get("README.md", "")[:100],
+                "private": False,
+                "auto_init": False
+            },
+            timeout=30
+        )
+        
+        if resp.status_code not in [200, 201]:
+            log.warning(f"GitHub repo creation failed: {resp.status_code}")
+            return f"local:/tmp/tools/{tool_name}"
+        
+        repo_url = resp.json()["html_url"]
+        clone_url = resp.json()["clone_url"]
+        
+        # Initialize git and push
+        os.chdir(tool_dir)
+        commands = [
+            ["git", "init"],
+            ["git", "add", "."],
+            ["git", "commit", "-m", "Initial commit"],
+            ["git", "branch", "-M", "main"],
+            ["git", "remote", "add", "origin", clone_url.replace("https://", f"https://{GITHUB_TOKEN}@")],
+            ["git", "push", "-u", "origin", "main"]
+        ]
+        
+        for cmd in commands:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                log.warning(f"Git command failed: {' '.join(cmd)} - {result.stderr}")
+        
+        log.info(f"  ✅ Deployed to GitHub: {repo_url}")
+        return repo_url
+        
+    except Exception as e:
+        log.error(f"deploy_to_github error: {e}")
+        return f"local:/tmp/tools/{tool_name}"
