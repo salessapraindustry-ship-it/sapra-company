@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ================================================================
 #  seller_b2b.py — B2B Productized Seller
-#  Lists tools on RapidAPI, AppSumo, sets up Stripe subscriptions
+#  Lists tools on RapidAPI, AppSumo, LemonSqueezy, Gumroad
 #  Focus: passive recurring revenue from businesses
 # ================================================================
 
@@ -21,6 +21,23 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger(__name__)
+
+def _retry_api(fn, retries=3, delay=2):
+    """Retry any API call on failure."""
+    import time
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt < retries - 1:
+                import logging
+                logging.getLogger(__name__).warning(f'API retry {attempt+1}/{retries}: {e}')
+                time.sleep(delay)
+            else:
+                import logging
+                logging.getLogger(__name__).error(f'API failed after {retries} attempts: {e}')
+                return None
+
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL             = "claude-haiku-4-5-20251001"
@@ -215,7 +232,7 @@ def run():
     log.info("=" * 60)
     log.info("  B2B SELLER — ONLINE")
     log.info(f"  {datetime.now()}")
-    log.info("  I list tools where businesses pay. RapidAPI. AppSumo. Stripe.")
+    log.info("  I list tools where businesses pay. RapidAPI. AppSumo. LemonSqueezy. Gumroad.")
     log.info("=" * 60)
 
     state = _load_state()
