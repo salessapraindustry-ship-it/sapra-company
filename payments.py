@@ -15,6 +15,23 @@ import shared_memory as sm
 
 log = logging.getLogger(__name__)
 
+def _retry_api(fn, retries=3, delay=2):
+    """Retry any API call on failure."""
+    import time
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt < retries - 1:
+                import logging
+                logging.getLogger(__name__).warning(f'API retry {attempt+1}/{retries}: {e}')
+                time.sleep(delay)
+            else:
+                import logging
+                logging.getLogger(__name__).error(f'API failed after {retries} attempts: {e}')
+                return None
+
+
 LEMONSQUEEZY_KEY  = os.environ.get("LEMONSQUEEZY_KEY", "")
 LEMONSQUEEZY_STORE= os.environ.get("LEMONSQUEEZY_STORE_ID", "")
 GUMROAD_TOKEN     = os.environ.get("GUMROAD_TOKEN", "")
