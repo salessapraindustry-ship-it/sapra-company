@@ -65,11 +65,15 @@ def _save_state(state):
 
 
 def web_search(query):
-    """Search the web for real data."""
+    """Search the web for real data. Returns empty list on any failure."""
     try:
+        serper_key = os.environ.get("SERPER_API_KEY", "")
+        if not serper_key:
+            log.warning("No SERPER_API_KEY — skipping web search")
+            return []
         resp = requests.get(
             "https://google.serper.dev/search",
-            headers={"X-API-KEY": os.environ.get("SERPER_API_KEY", ""),
+            headers={"X-API-KEY": serper_key,
                      "Content-Type": "application/json"},
             json={"q": query, "num": 5},
             timeout=10
@@ -80,6 +84,8 @@ def web_search(query):
                      "snippet": r.get("snippet",""),
                      "url": r.get("link","")}
                     for r in results[:5]]
+        else:
+            log.warning(f"Serper returned {resp.status_code}")
     except Exception as e:
         log.warning(f"Search failed: {e}")
     return []
@@ -173,6 +179,11 @@ def deep_research(task):
         results = web_search(q)
         all_results.extend(results)
         time.sleep(1)
+
+    # If no search results, use a default context
+    if not all_results:
+        log.warning("No search results — using Claude knowledge for validation")
+        all_results = [{"title": description, "snippet": description, "url": ""}]
 
     # Validate opportunity
     validation = validate_opportunity(description, all_results)
