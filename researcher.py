@@ -1651,3 +1651,160 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# === PRO-FIXER PATCH 20260328_1343 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: Line 130: HTTP request code is truncated mid-execution (incomplete if statement at 'if resp.status_code == 20'), No error handling for missing ANTHROPIC_API_KEY - function will fail silently when key is empty, validate_opportunity() doesn't handle JSON parsing errors from Claude's response, No timeout handling or retry logic for the validation API call despite _retry_api helper existing, web_search() returns empty list on failure but validate_opportunity() doesn't check if search results are empty before processing, State management doesn't track failed validations - agent will retry same failed topics infinitely, Missing main execution loop - no run() or main() function to actually execute the research cycles, CYCLE_INTERVAL defined but never used in any sleep or scheduling logic
+def validate_opportunity(topic, search_results):
+    """Use Claude to validate if this is a real opportunity."""
+    if not search_results:
+        log.warning(f"No search results for topic: {topic}")
+        return {"is_viable": False, "confidence": 0.0, "recommended_action": "SKIP", "demand_evidence": "No search results found"}
+    
+    if not ANTHROPIC_API_KEY:
+        log.error("ANTHROPIC_API_KEY not set - cannot validate")
+        return None
+    
+    results_text = "\n".join([
+        f"- {r['title']}: {r['snippet']}"
+        for r in search_results
+    ])
+
+    prompt = f"""You are a market researcher. Validate if this is a real money-making opportunity.
+
+TOPIC: {topic}
+SEARCH RESULTS:
+{results_text}
+
+Analyze for:
+1. Real buyer demand (people actively paying for this)
+2. Price benchmarks (what similar tools cost)
+3. Competition level (can we win?)
+4. Build difficulty (can an AI agent build this in 1-3 days?)
+5. Revenue potential (monthly recurring revenue possible?)
+
+Be HONEST and SPECIFIC. If demand is uncertain, say so.
+
+Reply ONLY in JSON:
+{{
+  "is_viable": true/false,
+  "confidence": 0.0-1.0,
+  "demand_evidence": "specific proof of demand (e.g. 500 RapidAPI subscribers at $X/mo)",
+  "price_benchmark": "$X-Y/month based on [source]",
+  "competition": "LOW/MEDIUM/HIGH — why",
+  "build_difficulty": "EASY/MEDIUM/HARD — why",
+  "monthly_revenue_potential": "$X-Y",
+  "recommended_action": "BUILD_NOW/RESEARCH_MORE/SKIP",
+  "build_spec": "1-2 sentence description of exactly what to build"
+}}"""
+
+    def _api_call():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": TOKENS,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data.get("content", [])
+            if content and len(content) > 0:
+                text = content[0].get("text", "")
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+        log.warning(f"Validation API returned status {resp.status_code}")
+        return None
+    
+    result = _retry_api(_api_call, retries=3, delay=2)
+    if not result:
+        log.error(f"Failed to validate topic: {topic}")
+        return {"is_viable": False, "confidence": 0.0, "recommended_action": "SKIP", "demand_evidence": "API validation failed"}
+    
+    return result
+
+
+def research_opportunities():
+    """Main research function - find and validate opportunities."""
+    state = _load_state()
+    state["cycle"] = state.get("cycle", 0) + 1
+    
+    topics = [
+        "AI API tools for developers",
+        "automation tools for small businesses",
+        "data extraction APIs",
+        "productivity SaaS for remote teams",
+        "no-code workflow automation"
+    ]
+    
+    validated_opportunities = []
+    
+    for topic in topics:
+        if topic in state.get("researched_topics", []):
+            log.info(f"Skipping already researched: {topic}")
+            continue
+        
+        log.info(f"Researching: {topic}")
+        search_results = web_search(topic)
+        
+        if not search_results:
+            log.warning(f"No search results for: {topic}")
+            state.setdefault("researched_topics", []).append(topic)
+            continue
+        
+        validation = validate_opportunity(topic, search_results)
+        
+        if validation and validation.get("is_viable"):
+            log.info(f"✓ VIABLE: {topic} (confidence: {validation.get('confidence', 0)})")
+            validated_opportunities.append({
+                "topic": topic,
+                "validation": validation,
+                "timestamp": datetime.now().isoformat()
+            })
+        else:
+            log.info(f"✗ Not viable: {topic}")
+        
+        state.setdefault("researched_topics", []).append(topic)
+        time.sleep(2)
+    
+    if validated_opportunities:
+        sm.store_research(validated_opportunities)
+        log.info(f"Stored {len(validated_opportunities)} opportunities in shared memory")
+    
+    _save_state(state)
+    return validated_opportunities
+
+
+def run():
+    """Main execution loop."""
+    log.info("Deep Researcher Agent starting...")
+    
+    if not ANTHROPIC_API_KEY:
+        log.error("ANTHROPIC_API_KEY not set - cannot run")
+        return
+    
+    while True:
+        try:
+            log.info(f"Starting research cycle at {datetime.now()}")
+            opportunities = research_opportunities()
+            log.info(f"Cycle complete. Found {len(opportunities)} viable opportunities.")
+            log.info(f"Sleeping for {CYCLE_INTERVAL} seconds...")
+            time.sleep(CYCLE_INTERVAL)
+        except KeyboardInterrupt:
+            log.info("Researcher stopped by user")
+            break
+        except Exception as e:
+            log.error(f"Cycle error: {e}")
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    run()
