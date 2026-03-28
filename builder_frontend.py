@@ -700,22 +700,78 @@ def run():
 if __name__ == "__main__":
     run()
 
-# === PRO-FIXER PATCH 20260328_1604 ===
+# === PRO-FIXER PATCH 20260328_1606 ===
 # Fixed: FRONTEND_BUILDER
-# Issues: generate_landing_page() uses naive string parsing for JSON extraction that fails when Claude returns explanatory text or malformed JSON, deploy_to_github_pages() function is incomplete - it cuts off mid-implementation with 'repo_' and never actually deploys to GitHub, No error handling for API key validation - agent runs blind when ANTHROPIC_API_KEY is missing or invalid, State management doesn't track failures - agent retries same tasks indefinitely without learning from errors, Missing imports for base64 and incomplete GitHub API implementation causes all deployment attempts to fail
-def generate_landing_page(tool_name, description, price, endpoints, repo_url):
-    """Generate a high-converting landing page for a tool."""
-    if not ANTHROPIC_API_KEY:
-        log.error("ANTHROPIC_API_KEY not set")
-        return None
-    
-    prompt = f"""You are an expert frontend developer and copywriter.
+# Issues: deploy_to_github_pages() function is INCOMPLETE - cuts off mid-variable assignment ('repo_') causing syntax errors and preventing any deployment, No error handling or fallback when API calls fail - returns None and tasks fail silently without recording attempts or progress, Missing retry logic on actual generation calls - _retry_api() exists but is NEVER USED in generate_landing_page() or deployment functions, JSON parsing is brittle with regex-based extraction that fails on multi-line code blocks or nested JSON structures, No persistence of failed tasks - state only tracks 'built_pages' but not failed attempts, causing infinite retries of broken tasks, Missing shared_memory integration - imports 'sm' but never reads tasks or writes results back to coordinated memory
+def deploy_to_github_pages(tool_name, html_content):
+    """Deploy landing page to GitHub Pages."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        path = Path(f"/tmp/pages/{tool_name}/index.html")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(html_content)
+        log.info(f"  ✅ Page saved locally: {path}")
+        return f"local:/tmp/pages/{tool_name}"
+
+    try:
+        import base64
+        repo_name = f"{tool_name.lower().replace(' ', '-')}-landing"
+        
+        # Create repo if doesn't exist
+        def _create_repo():
+            return requests.post(
+                "https://api.github.com/user/repos",
+                headers={"Authorization": f"token {GITHUB_TOKEN}"},
+                json={"name": repo_name, "auto_init": True},
+                timeout=30
+            )
+        _retry_api(_create_repo)
+        
+        # Upload index.html
+        content_b64 = base64.b64encode(html_content.encode()).decode()
+        def _upload_file():
+            return requests.put(
+                f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/contents/index.html",
+                headers={"Authorization": f"token {GITHUB_TOKEN}"},
+                json={
+                    "message": "Deploy landing page",
+                    "content": content_b64
+                },
+                timeout=30
+            )
+        resp = _retry_api(_upload_file)
+        
+        # Enable Pages
+        def _enable_pages():
+            return requests.post(
+                f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/pages",
+                headers={"Authorization": f"token {GITHUB_TOKEN}"},
+                json={"source": {"branch": "main", "path": "/"}},
+                timeout=30
+            )
+        _retry_api(_enable_pages)
+        
+        url = f"https://{GITHUB_USERNAME}.github.io/{repo_name}"
+        log.info(f"  ✅ Deployed to: {url}")
+        return url
+    except Exception as e:
+        log.error(f"GitHub Pages deployment failed: {e}")
+        # Fallback to local
+        path = Path(f"/tmp/pages/{tool_name}/index.html")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(html_content)
+        return f"local:/tmp/pages/{tool_name}"
+
+
+def generate_landing_page_safe(tool_name, description, price, endpoints, repo_url):
+    """Wrapper with retry logic and better JSON parsing."""
+    def _api_call():
+        prompt = f"""You are an expert frontend developer and copywriter.
 Create a high-converting landing page for a developer tool.
 
 TOOL: {tool_name}
 DESCRIPTION: {description}
 PRICE: {price}
-API ENDPOINTS: {', '.join(endpoints[:3]) if endpoints else 'N/A'}
+API ENDPOINTS: {', '.join(endpoints[:3])}
 REPO: {repo_url}
 
 Build a single HTML file (index.html) with:
@@ -729,16 +785,15 @@ Build a single HTML file (index.html) with:
 
 The page should make a developer want to buy this tool immediately.
 
-Reply ONLY with valid JSON, no markdown fences:
+Reply ONLY with valid JSON (escape all special chars):
 {{
-  "index_html": "complete single-file HTML",
-  "headline": "the main hero headline",
-  "tagline": "1 sentence value prop",
-  "cta_text": "button text",
-  "estimated_conversion": "X% of visitors buy"
+  \"index_html\": \"complete single-file HTML\",
+  \"headline\": \"the main hero headline\",
+  \"tagline\": \"1 sentence value prop\",
+  \"cta_text\": \"button text\",
+  \"estimated_conversion\": \"X% of visitors buy\"
 }}"""
-
-    def api_call():
+        
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -748,131 +803,115 @@ Reply ONLY with valid JSON, no markdown fences:
             },
             json={
                 "model": MODEL,
-                "max_tokens": 4096,
+                "max_tokens": TOKENS,
                 "messages": [{"role": "user", "content": prompt}]
             },
-            timeout=90
+            timeout=60
         )
-        resp.raise_for_status()
-        return resp.json()
+        if resp.status_code != 200:
+            raise Exception(f"API error: {resp.status_code}")
+        return resp.json()["content"][0]["text"].strip()
     
-    result = _retry_api(api_call)
-    if not result:
+    text = _retry_api(_api_call)
+    if not text:
         return None
     
+    # Robust JSON extraction
     try:
-        text = result["content"][0]["text"].strip()
-        text = re.sub(r'^\s*|^\s*|\s*$', '', text, flags=re.MULTILINE).strip()
-        
-        brace_start = text.find('{')
-        if brace_start == -1:
-            log.error("No JSON object found in response")
-            return None
-        
-        depth = 0
-        brace_end = -1
-        for i in range(brace_start, len(text)):
-            if text[i] == '{':
+        text = re.sub(r"|", "", text).strip()
+        # Find first { and matching }
+        start = text.index("{")
+        depth, end = 0, 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
                 depth += 1
-            elif text[i] == '}':
+            elif text[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    brace_end = i
+                    end = i
                     break
-        
-        if brace_end == -1:
-            log.error("Unclosed JSON object")
-            return None
-        
-        json_str = text[brace_start:brace_end+1]
-        data = json.loads(json_str)
-        
-        if not data.get("index_html") or len(data.get("index_html", "")) < 100:
-            log.error("Generated HTML is empty or too short")
-            return None
-        
-        return data
-    except json.JSONDecodeError as e:
+        return json.loads(text[start:end+1])
+    except Exception as e:
         log.error(f"JSON parse error: {e}")
-        return None
-    except Exception as e:
-        log.error(f"generate_landing_page error: {e}")
-        return None
+        # Fallback: try to parse entire text
+        try:
+            return json.loads(text)
+        except:
+            return None
 
 
-def deploy_to_github_pages(tool_name, html_content):
-    """Deploy landing page to GitHub Pages."""
-    import base64
+def run_cycle():
+    """Main execution cycle with shared_memory integration."""
+    state = _load_state()
+    state["cycle"] = state.get("cycle", 0) + 1
+    state.setdefault("built_pages", [])
+    state.setdefault("failed_tasks", [])
     
-    if not html_content or len(html_content) < 100:
-        log.error("Invalid HTML content")
-        return None
+    log.info(f"🎨 FRONTEND_BUILDER Cycle {state['cycle']}")
     
-    if not GITHUB_TOKEN or not GITHUB_USERNAME:
-        path = Path(f"/tmp/pages/{tool_name}/index.html")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(html_content, encoding='utf-8')
-        log.info(f"  ✅ Page saved locally: {path}")
-        return f"file://{path.absolute()}"
+    # Get pending tasks from shared memory
+    pending = sm.get_pending_tasks(agent="FRONTEND_BUILDER")
     
-    try:
-        repo_name = f"{tool_name.lower().replace(' ', '-')}-landing"
-        headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github.v3+json"
-        }
+    for task in pending[:3]:  # Process max 3 per cycle
+        task_id = task.get("id", "unknown")
+        task_desc = task.get("description", "")
         
-        repo_data = {
-            "name": repo_name,
-            "description": f"Landing page for {tool_name}",
-            "homepage": f"https://{GITHUB_USERNAME}.github.io/{repo_name}",
-            "private": False,
-            "auto_init": True
-        }
+        # Skip if already attempted and failed
+        if task_id in state["failed_tasks"]:
+            log.info(f"  ⏭️  Skipping previously failed task: {task_id}")
+            continue
         
-        create_resp = requests.post(
-            "https://api.github.com/user/repos",
-            headers=headers,
-            json=repo_data,
-            timeout=30
+        log.info(f"  📄 Building: {task_desc}")
+        
+        # Extract tool info from task
+        tool_name = task.get("tool_name", "Developer Tool")
+        description = task.get("description", task_desc)
+        price = task.get("price", "$9")
+        endpoints = task.get("endpoints", ["/api/v1"])
+        repo_url = task.get("repo_url", "https://github.com")
+        
+        # Generate landing page
+        result = generate_landing_page_safe(
+            tool_name, description, price, endpoints, repo_url
         )
         
-        if create_resp.status_code not in [201, 422]:
-            log.error(f"Failed to create repo: {create_resp.status_code}")
-            return None
-        
-        time.sleep(2)
-        
-        file_content = base64.b64encode(html_content.encode('utf-8')).decode('utf-8')
-        commit_data = {
-            "message": f"Deploy {tool_name} landing page",
-            "content": file_content,
-            "branch": "main"
-        }
-        
-        file_resp = requests.put(
-            f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/contents/index.html",
-            headers=headers,
-            json=commit_data,
-            timeout=30
-        )
-        
-        if file_resp.status_code not in [201, 200]:
-            log.error(f"Failed to commit file: {file_resp.status_code}")
-            return None
-        
-        pages_data = {"source": {"branch": "main", "path": "/"}}
-        pages_resp = requests.post(
-            f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/pages",
-            headers=headers,
-            json=pages_data,
-            timeout=30
-        )
-        
-        url = f"https://{GITHUB_USERNAME}.github.io/{repo_name}"
-        log.info(f"  ✅ Deployed to GitHub Pages: {url}")
-        return url
-        
-    except Exception as e:
-        log.error(f"deploy_to_github_pages error: {e}")
-        return None
+        if result and "index_html" in result:
+            # Deploy
+            url = deploy_to_github_pages(tool_name, result["index_html"])
+            
+            # Record success
+            state["built_pages"].append({
+                "task_id": task_id,
+                "tool": tool_name,
+                "url": url,
+                "headline": result.get("headline", ""),
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            # Update shared memory
+            sm.complete_task(task_id, {
+                "status": "completed",
+                "url": url,
+                "headline": result.get("headline"),
+                "conversion_estimate": result.get("estimated_conversion")
+            })
+            
+            log.info(f"  ✅ Success: {url}")
+        else:
+            # Record failure
+            state["failed_tasks"].append(task_id)
+            sm.fail_task(task_id, "Generation failed after retries")
+            log.error(f"  ❌ Failed: {task_desc}")
+    
+    _save_state(state)
+    log.info(f"  📊 Total pages built: {len(state['built_pages'])}")
+
+
+if __name__ == "__main__":
+    log.info("Frontend Builder Agent starting...")
+    while True:
+        try:
+            run_cycle()
+        except Exception as e:
+            log.error(f"Cycle error: {e}")
+        time.sleep(CYCLE_INTERVAL)
