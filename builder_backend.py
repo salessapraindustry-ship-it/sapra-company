@@ -5412,3 +5412,152 @@ if __name__ == "__main__":
             log.error(f"Cycle error: {e}")
         log.info(f"\nSleeping {CYCLE_INTERVAL}s...\n")
         time.sleep(CYCLE_INTERVAL)
+
+
+# === PRO-FIXER PATCH 20260328_1453 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() returns JSON with code strings but doesn't handle newlines, quotes, or special characters properly - causes JSON parsing failures downstream, deploy_to_github() function is incomplete - cuts off mid-request, causing all deployments to fail silently, No validation or error handling for LLM response structure - assumes perfect JSON from Claude every time, Missing backoff/retry logic in API calls despite having _retry_api helper that's never used, No token budget management - requests only 2048 tokens but backend code generation needs 16000+ tokens for complete files, State persistence fails silently - _save_state() swallows all exceptions, losing progress tracking, Task description prompt is too vague - doesn't specify Python version, framework details, or provide working code examples
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+IMPORTANT: Return ONLY valid JSON. Escape all newlines in code as \\n and all quotes as \\".
+
+Reply in JSON:
+{{
+  "tool_name": "snake_case_name",
+  "description": "what this tool does in 1 sentence",
+  "main_py": "complete main.py code with \\n for newlines",
+  "requirements_txt": "fastapi\\nuvicorn\\npydantic",
+  "readme_md": "markdown README with usage examples",
+  "api_endpoints": ["GET /endpoint1", "POST /endpoint2"],
+  "suggested_price": "$X/month",
+  "deployment_cmd": "railway up or render deploy command"
+}}"""
+
+    def _call():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": 16384,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=120
+        )
+        if resp.status_code != 200:
+            raise Exception(f"API returned {resp.status_code}: {resp.text}")
+        
+        text = resp.json()["content"][0]["text"].strip()
+        text = re.sub(r"\s*", "", text)
+        text = re.sub(r"\s*$", "", text)
+        text = text.strip()
+        
+        start = text.find("{")
+        if start == -1:
+            raise Exception("No JSON object found in response")
+        
+        depth, end = 0, len(text) - 1
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        
+        json_str = text[start:end+1]
+        data = json.loads(json_str)
+        
+        required = ["tool_name", "main_py", "requirements_txt", "readme_md"]
+        for field in required:
+            if field not in data or not data[field]:
+                raise Exception(f"Missing required field: {field}")
+        
+        return data
+    
+    return _retry_api(_call, retries=3, delay=3)
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        log.info(f"  ✅ Tool saved locally: {tool_dir}")
+        return f"local:/tmp/tools/{tool_name}"
+
+    try:
+        resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json={
+                "name": tool_name,
+                "description": files.get("README.md", "")[:100],
+                "private": False,
+                "auto_init": True
+            },
+            timeout=30
+        )
+        
+        if resp.status_code not in [201, 422]:
+            raise Exception(f"GitHub API error: {resp.status_code} {resp.text}")
+        
+        repo_url = f"https://github.com/{GITHUB_USERNAME}/{tool_name}"
+        
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        
+        subprocess.run(["git", "init"], cwd=tool_dir, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=tool_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=tool_dir, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=tool_dir, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", f"https://{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{tool_name}.git"],
+            cwd=tool_dir, check=True, capture_output=True
+        )
+        subprocess.run(["git", "push", "-u", "origin", "main", "--force"], cwd=tool_dir, check=True, capture_output=True)
+        
+        log.info(f"  ✅ Deployed to GitHub: {repo_url}")
+        return repo_url
+        
+    except Exception as e:
+        log.error(f"GitHub deployment failed: {e}")
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        return f"local:/tmp/tools/{tool_name}"
+
+
+def _save_state(state):
+    try:
+        with open(state_file, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log.error(f"Failed to save state: {e}")
