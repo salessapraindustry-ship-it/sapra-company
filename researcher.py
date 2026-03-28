@@ -229,6 +229,11 @@ def run():
 
     state = _load_state()
 
+
+    # Stagger startup to avoid Google Sheets quota
+    log.info(f"  ⏳ Staggered start — waiting 30s")
+    time.sleep(30)
+
     while True:
         state["cycle"] += 1
         log.info(f"\n{'='*60}")
