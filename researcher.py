@@ -901,3 +901,167 @@ if __name__ == "__main__":
         
         log.info(f"Sleeping {CYCLE_INTERVAL}s...")
         time.sleep(CYCLE_INTERVAL)
+
+# === PRO-FIXER PATCH 20260328_1319 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: validate_opportunity() function is truncated mid-execution at line 134 - the API response handling code is incomplete, No JSON parsing or error handling for Claude's response in validate_opportunity(), No validation that search_results is not empty before passing to validate_opportunity(), Missing main execution loop and task processing logic, No integration with shared_memory to read tasks from CEO or write validated opportunities back, State management exists but is never used in task execution flow, web_search() silently returns empty list on failure, causing validate_opportunity() to run with no data, No retry logic on validation failures - agent gives up after first attempt
+def validate_opportunity(topic, search_results):
+    """Use Claude to validate if this is a real opportunity."""
+    if not search_results:
+        log.warning(f"No search results for topic: {topic}")
+        return None
+
+    results_text = "\n".join([
+        f"- {r['title']}: {r['snippet']}"
+        for r in search_results
+    ])
+
+    prompt = f"""You are a market researcher. Validate if this is a real money-making opportunity.
+
+TOPIC: {topic}
+SEARCH RESULTS:
+{results_text}
+
+Analyze for:
+1. Real buyer demand (people actively paying for this)
+2. Price benchmarks (what similar tools cost)
+3. Competition level (can we win?)
+4. Build difficulty (can an AI agent build this in 1-3 days?)
+5. Revenue potential (monthly recurring revenue possible?)
+
+Be HONEST and SPECIFIC. If demand is uncertain, say so.
+
+Reply ONLY in JSON:
+{{
+  "is_viable": true/false,
+  "confidence": 0.0-1.0,
+  "demand_evidence": "specific proof of demand",
+  "price_benchmark": "$X-Y/month based on source",
+  "competition": "LOW/MEDIUM/HIGH — why",
+  "build_difficulty": "EASY/MEDIUM/HARD — why",
+  "monthly_revenue_potential": "$X-Y",
+  "recommended_action": "BUILD_NOW/RESEARCH_MORE/SKIP",
+  "build_spec": "1-2 sentence description"
+}}"""
+
+    def _api_call():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": TOKENS,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    api_response = _retry_api(_api_call, retries=3, delay=2)
+    if not api_response:
+        return None
+
+    try:
+        content = api_response.get("content", [])
+        if not content:
+            log.error("Empty content in API response")
+            return None
+        
+        text = content[0].get("text", "")
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+        if not json_match:
+            log.error(f"No JSON found in response: {text[:200]}")
+            return None
+        
+        validation = json.loads(json_match.group())
+        validation["topic"] = topic
+        validation["timestamp"] = datetime.now().isoformat()
+        return validation
+    except json.JSONDecodeError as e:
+        log.error(f"JSON parse error: {e}")
+        return None
+    except Exception as e:
+        log.error(f"Validation processing error: {e}")
+        return None
+
+
+def process_research_task(task):
+    """Process a single research task with retries."""
+    topic = task.get("query", "")
+    if not topic:
+        log.warning("Empty research query")
+        return None
+
+    log.info(f"Researching: {topic}")
+    
+    for attempt in range(3):
+        search_results = web_search(topic)
+        if not search_results:
+            log.warning(f"Search attempt {attempt+1}/3 returned no results")
+            time.sleep(2)
+            continue
+        
+        validation = validate_opportunity(topic, search_results)
+        if validation:
+            log.info(f"Validated {topic}: viable={validation.get('is_viable')} confidence={validation.get('confidence')}")
+            return validation
+        
+        log.warning(f"Validation attempt {attempt+1}/3 failed")
+        time.sleep(2)
+    
+    log.error(f"Failed to validate {topic} after 3 attempts")
+    return None
+
+
+def main():
+    log.info("Deep Researcher agent starting...")
+    state = _load_state()
+    
+    while True:
+        try:
+            tasks = sm.read("research_tasks") or []
+            
+            if tasks:
+                task = tasks[0]
+                log.info(f"Processing task: {task}")
+                
+                validation = process_research_task(task)
+                
+                if validation:
+                    if validation.get("is_viable") and validation.get("confidence", 0) > 0.6:
+                        opportunities = sm.read("validated_opportunities") or []
+                        opportunities.append(validation)
+                        sm.write("validated_opportunities", opportunities)
+                        log.info(f"✓ Validated opportunity: {validation.get('topic')}")
+                    else:
+                        log.info(f"✗ Rejected opportunity: {validation.get('topic')} (confidence={validation.get('confidence')})")
+                    
+                    state["researched_topics"].append(task.get("query"))
+                else:
+                    log.warning(f"Could not validate: {task.get('query')}")
+                
+                remaining = tasks[1:]
+                sm.write("research_tasks", remaining)
+            else:
+                log.info("No research tasks pending")
+            
+            state["cycle"] += 1
+            _save_state(state)
+            
+            time.sleep(CYCLE_INTERVAL)
+            
+        except KeyboardInterrupt:
+            log.info("Researcher shutting down...")
+            break
+        except Exception as e:
+            log.error(f"Main loop error: {e}")
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()
