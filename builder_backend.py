@@ -222,6 +222,24 @@ def build_tool(task):
     }
     repo_url = deploy_to_github(tool_name, files)
 
+    # ── Autonomous payment setup ───────────────────────────────
+    try:
+        import payments
+        price     = float(
+            code.get("suggested_price","$29/month")
+            .replace("$","").replace("/month","").strip()
+        )
+        pay_links = payments.monetize_tool(
+            tool_name    = tool_name,
+            description  = code.get("description",""),
+            repo_url     = repo_url,
+            landing_url  = repo_url,
+            price_usd    = price if price > 0 else 29.0
+        )
+    except Exception as e:
+        log.warning(f"Payment setup error: {e}")
+        pay_links = {}
+
     result = (
         f"BUILT: {tool_name} | "
         f"Price: {code.get('suggested_price','?')} | "
