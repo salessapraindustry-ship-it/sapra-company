@@ -1956,3 +1956,112 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# === PRO-FIXER PATCH 20260328_1404 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: CRITICAL: Line 145 has truncated code - 'if resp.status_code == 20' is incomplete, missing status code check (likely 200), CRITICAL: JSON parsing likely fails in validate_opportunity() - Claude returns markdown-wrapped JSON ( blocks) but code tries to parse raw response, CRITICAL: No error handling for malformed JSON responses from Claude API, Missing validation error details - validation failures don't log WHY they failed, Web search returns empty list on failure but code doesn't check if results are empty before validating, No retry logic on Claude API calls despite having _retry_api helper function, State persistence may fail silently - no verification that topics are actually saved, SERPER_API_KEY check happens too late - should fail fast if missing
+def validate_opportunity(topic, search_results):
+    """Use Claude to validate if this is a real opportunity."""
+    if not search_results:
+        log.warning(f"No search results for '{topic}' - skipping validation")
+        return None
+        
+    results_text = "\n".join([
+        f"- {r['title']}: {r['snippet']}"
+        for r in search_results
+    ])
+
+    prompt = f"""You are a market researcher. Validate if this is a real money-making opportunity.
+
+TOPIC: {topic}
+SEARCH RESULTS:
+{results_text}
+
+Analyze for:
+1. Real buyer demand (people actively paying for this)
+2. Price benchmarks (what similar tools cost)
+3. Competition level (can we win?)
+4. Build difficulty (can an AI agent build this in 1-3 days?)
+5. Revenue potential (monthly recurring revenue possible?)
+
+Be HONEST and SPECIFIC. If demand is uncertain, say so.
+
+Reply ONLY in JSON:
+{{
+  "is_viable": true/false,
+  "confidence": 0.0-1.0,
+  "demand_evidence": "specific proof of demand (e.g. 500 RapidAPI subscribers at $X/mo)",
+  "price_benchmark": "$X-Y/month based on [source]",
+  "competition": "LOW/MEDIUM/HIGH — why",
+  "build_difficulty": "EASY/MEDIUM/HARD — why",
+  "monthly_revenue_potential": "$X-Y",
+  "recommended_action": "BUILD_NOW/RESEARCH_MORE/SKIP",
+  "build_spec": "1-2 sentence description of exactly what to build"
+}}"""
+
+    def _call_claude():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": TOKENS,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            log.error(f"Claude API returned {resp.status_code}: {resp.text[:200]}")
+            return None
+    
+    result = _retry_api(_call_claude, retries=3, delay=2)
+    if not result:
+        log.error(f"Validation failed for '{topic}' - Claude API unavailable")
+        return None
+    
+    try:
+        content = result.get("content", [])
+        if not content:
+            log.error(f"Validation failed for '{topic}' - empty response from Claude")
+            return None
+            
+        text = content[0].get("text", "")
+        if not text:
+            log.error(f"Validation failed for '{topic}' - no text in response")
+            return None
+        
+        # Strip markdown code blocks if present
+        text = text.strip()
+        if text.startswith(""):
+            text = text[7:]  # Remove 
+        if text.startswith(""):
+            text = text[3:]  # Remove 
+        if text.endswith(""):
+            text = text[:-3]  # Remove trailing 
+        text = text.strip()
+        
+        validation = json.loads(text)
+        
+        # Verify required fields
+        required = ["is_viable", "confidence", "recommended_action"]
+        missing = [f for f in required if f not in validation]
+        if missing:
+            log.error(f"Validation failed for '{topic}' - missing fields: {missing}")
+            return None
+            
+        log.info(f"Validated '{topic}': viable={validation.get('is_viable')}, confidence={validation.get('confidence')}, action={validation.get('recommended_action')}")
+        return validation
+        
+    except json.JSONDecodeError as e:
+        log.error(f"Validation failed for '{topic}' - JSON parse error: {e}")
+        log.error(f"Raw response text: {text[:500]}")
+        return None
+    except Exception as e:
+        log.error(f"Validation failed for '{topic}' - unexpected error: {e}")
+        return None
