@@ -2833,3 +2833,207 @@ def _save_state(state):
         os.replace(temp_file, state_file)
     except Exception as e:
         log.error(f"State save failed: {e}")
+
+# === PRO-FIXER PATCH 20260328_1343 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() returns raw JSON that contains unescaped Python code strings, causing JSON parsing failures when code contains quotes, newlines, or special characters, The LLM prompt asks for code inside JSON fields but doesn't instruct the model to escape special characters, leading to malformed JSON responses, deploy_to_github() function is incomplete - cuts off mid-implementation, preventing any deployment, No error handling for malformed LLM responses - when JSON parsing fails, the entire agent fails silently, The prompt requests 'main_py' with complete Python code but doesn't specify proper escaping, making valid JSON responses nearly impossible
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+Reply with:
+1. A JSON metadata block with tool_name, description, api_endpoints, suggested_price
+2. Then separate code blocks for each file
+
+Format:
+
+{{
+  "tool_name": "snake_case_name",
+  "description": "what this tool does",
+  "api_endpoints": ["GET /endpoint1"],
+  "suggested_price": "$5/month"
+}}
+
+
+:main.py
+# Your main.py code here
+
+
+text:requirements.txt
+fastapi
+uvicorn
+
+
+markdown:README.md
+# Tool Name
+Usage...
+"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": 4096,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=90
+        )
+        if resp.status_code != 200:
+            log.error(f"API error {resp.status_code}: {resp.text}")
+            return None
+            
+        text = resp.json()["content"][0]["text"].strip()
+        
+        # Extract JSON metadata
+        json_match = re.search(r'\s*({.*?})\s*', text, re.DOTALL)
+        if not json_match:
+            json_match = re.search(r'{\s*"tool_name".*?}', text, re.DOTALL)
+        
+        if not json_match:
+            log.error("No JSON metadata found in response")
+            return None
+            
+        metadata = json.loads(json_match.group(1) if json_match.lastindex else json_match.group(0))
+        
+        # Extract code blocks
+        files = {}
+        
+        # Extract main.py
+        main_match = re.search(r':?(?:main\.py)?\s*\n(.*?)', text, re.DOTALL)
+        if main_match:
+            files['main.py'] = main_match.group(1).strip()
+        
+        # Extract requirements.txt
+        req_match = re.search(r'(?:text:|txt:)?requirements\.txt\s*\n(.*?)', text, re.DOTALL)
+        if req_match:
+            files['requirements.txt'] = req_match.group(1).strip()
+        elif 'requirements_txt' in metadata:
+            files['requirements.txt'] = metadata['requirements_txt']
+        
+        # Extract README.md
+        readme_match = re.search(r'markdown:?(?:README\.md)?\s*\n(.*?)', text, re.DOTALL)
+        if readme_match:
+            files['README.md'] = readme_match.group(1).strip()
+        elif 'readme_md' in metadata:
+            files['README.md'] = metadata['readme_md']
+        
+        # Fallback: if no files extracted, try old format
+        if not files:
+            if 'main_py' in metadata:
+                files['main.py'] = metadata.get('main_py', '')
+            if 'requirements_txt' in metadata:
+                files['requirements.txt'] = metadata.get('requirements_txt', '')
+            if 'readme_md' in metadata:
+                files['README.md'] = metadata.get('readme_md', '')
+        
+        if not files.get('main.py'):
+            log.error("No main.py code generated")
+            return None
+        
+        result = {
+            "tool_name": metadata.get("tool_name", "unknown_tool"),
+            "description": metadata.get("description", "No description"),
+            "api_endpoints": metadata.get("api_endpoints", []),
+            "suggested_price": metadata.get("suggested_price", "$5/month"),
+            "files": files
+        }
+        
+        log.info(f"  ✅ Generated {result['tool_name']} with {len(files)} files")
+        return result
+        
+    except json.JSONDecodeError as e:
+        log.error(f"JSON parsing error: {e}")
+        log.error(f"Response text: {text[:500]}...")
+        return None
+    except Exception as e:
+        log.error(f"generate_backend_code error: {e}")
+        return None
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        log.info(f"  ✅ Tool saved locally: {tool_dir}")
+        return f"local:/tmp/tools/{tool_name}"
+
+    try:
+        # Create GitHub repo
+        repo_data = {
+            "name": tool_name,
+            "description": f"Auto-generated backend tool: {tool_name}",
+            "private": False,
+            "auto_init": False
+        }
+        
+        resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json=repo_data,
+            timeout=30
+        )
+        
+        if resp.status_code not in [201, 422]:  # 422 = already exists
+            log.error(f"GitHub repo creation failed: {resp.status_code} {resp.text}")
+            return deploy_to_github(tool_name, files)  # Fallback to local
+        
+        repo_url = f"https://github.com/{GITHUB_USERNAME}/{tool_name}"
+        
+        # Clone and push files
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        if tool_dir.exists():
+            subprocess.run(["rm", "-rf", str(tool_dir)], check=False)
+        
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        os.chdir(tool_dir)
+        
+        # Initialize git
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Backend Builder"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "builder@example.com"], check=True, capture_output=True)
+        
+        # Write files
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        
+        # Commit and push
+        subprocess.run(["git", "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], check=True, capture_output=True)
+        
+        remote_url = f"https://{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{tool_name}.git"
+        subprocess.run(["git", "remote", "add", "origin", remote_url], check=True, capture_output=True)
+        subprocess.run(["git", "push", "-u", "origin", "main"], check=True, capture_output=True)
+        
+        log.info(f"  ✅ Deployed to GitHub: {repo_url}")
+        return repo_url
+        
+    except subprocess.CalledProcessError as e:
+        log.error(f"Git command failed: {e}")
+        return f"local:/tmp/tools/{tool_name}"
+    except Exception as e:
+        log.error(f"deploy_to_github error: {e}")
+        return f"local:/tmp/tools/{tool_name}"
