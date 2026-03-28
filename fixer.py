@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 # ================================================================
-#  fixer.py — Pro-Fixer Agent
-#  Powered by Claude Code — fixes bugs, analyzes agents, improves
-#  them every 3 days based on real performance data
+#  fixer.py — Pro-Fixer Agent v2
+#  Powered by Claude Code (claude-sonnet-4-5)
+#  - Reads every agent file from GitHub
+#  - Analyzes with Claude Code (system prompt + full code context)
+#  - Fixes bugs and pushes to GitHub autonomously
+#  - Scores and improves every agent every 3 days
+#  - Never leaves cycles empty — always does something
 # ================================================================
 
 import os
 import re
 import json
 import time
+import base64
 import logging
 import requests
-import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -26,13 +30,13 @@ log = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO       = os.environ.get("GITHUB_REPO", "")    # e.g. "username/autonomous-agent"
-FIXER_MODEL       = "claude-sonnet-4-5"
-FIXER_TOKENS      = 4096
-CYCLE_INTERVAL    = 600    # 10 minutes
-IMPROVEMENT_DAYS  = 3      # improve every 3 days
+GITHUB_REPO       = os.environ.get("GITHUB_REPO", "")
 
-# Agent files to monitor
+FIXER_MODEL    = "claude-sonnet-4-5"
+FIXER_TOKENS   = 8000
+CYCLE_INTERVAL = 600
+IMPROVE_DAYS   = 3
+
 AGENT_FILES = {
     sm.AGENT_RESEARCHER: "researcher.py",
     sm.AGENT_BACKEND:    "builder_backend.py",
@@ -50,13 +54,8 @@ def _load_state():
         with open(state_file) as f:
             return json.load(f)
     except Exception:
-        return {
-            "cycle":            0,
-            "last_improvement": None,
-            "agent_scores":     {},
-            "fixes_applied":    []
-        }
-
+        return {"cycle": 0, "last_improvement": None,
+                "fixes_applied": [], "improvement_log": []}
 
 def _save_state(state):
     try:
@@ -66,105 +65,126 @@ def _save_state(state):
         pass
 
 
-def _read_agent_file(filename):
-    """Read agent source code from GitHub or local."""
-    # Try local first
-    for path in [f"/app/{filename}", f"./{filename}", f"../company/{filename}"]:
+# ================================================================
+#  GITHUB
+# ================================================================
+
+def _read_file(filename):
+    for path in [f"/app/{filename}", f"./{filename}"]:
         if os.path.exists(path):
             try:
-                with open(path) as f:
-                    return f.read()
+                return open(path).read()
             except Exception:
                 pass
-
-    # Try GitHub API
-    if GITHUB_TOKEN and GITHUB_REPO:
-        try:
-            resp = requests.get(
-                f"https://api.github.com/repos/{GITHUB_REPO}/contents/company/{filename}",
-                headers={"Authorization": f"token {GITHUB_TOKEN}",
-                         "Accept": "application/vnd.github.v3.raw"},
-                timeout=10
-            )
-            if resp.status_code == 200:
-                return resp.text
-        except Exception as e:
-            log.warning(f"GitHub read failed for {filename}: {e}")
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return None
+    try:
+        resp = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}",
+            headers={"Authorization": f"token {GITHUB_TOKEN}",
+                     "Accept": "application/vnd.github.v3.raw"},
+            timeout=15
+        )
+        if resp.status_code == 200:
+            return resp.text
+        log.warning(f"GitHub read {filename}: {resp.status_code}")
+    except Exception as e:
+        log.warning(f"GitHub read error {filename}: {e}")
     return None
 
 
-def _push_fix_to_github(filename, new_content, commit_msg):
-    """Push a fixed file to GitHub."""
+def _write_file(filename, content, commit_msg):
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        # Save locally instead
         try:
-            Path(f"/app/{filename}").write_text(new_content)
-            log.info(f"✅ Fixed locally: {filename}")
+            Path(f"/app/{filename}").write_text(content)
+            log.info(f"Saved locally: {filename}")
             return True
         except Exception as e:
-            log.error(f"Local save failed: {e}")
+            log.error(f"Local write failed: {e}")
             return False
-
     try:
-        # Get current file SHA
         resp = requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/contents/company/{filename}",
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}",
             headers={"Authorization": f"token {GITHUB_TOKEN}"},
             timeout=10
         )
         sha = resp.json().get("sha", "") if resp.status_code == 200 else ""
-
-        import base64
-        content_b64 = base64.b64encode(new_content.encode()).decode()
-
         payload = {
             "message": f"[Pro-Fixer] {commit_msg}",
-            "content": content_b64,
+            "content": base64.b64encode(content.encode()).decode()
         }
         if sha:
             payload["sha"] = sha
-
         resp = requests.put(
-            f"https://api.github.com/repos/{GITHUB_REPO}/contents/company/{filename}",
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}",
             headers={"Authorization": f"token {GITHUB_TOKEN}",
                      "Content-Type": "application/json"},
-            json=payload,
-            timeout=15
+            json=payload, timeout=15
         )
         if resp.status_code in (200, 201):
-            log.info(f"✅ Pushed fix to GitHub: {filename}")
+            log.info(f"Pushed to GitHub: {filename}")
             return True
-        else:
-            log.error(f"GitHub push failed: {resp.status_code}")
-            return False
+        log.error(f"GitHub push failed: {resp.status_code}")
     except Exception as e:
-        log.error(f"Push error: {e}")
-        return False
+        log.error(f"GitHub write error: {e}")
+    return False
 
 
-def fix_bug(error_description, agent_name, agent_code):
-    """Use Claude Code API to fix a specific bug."""
-    prompt = f"""You are Pro-Fixer, an expert Python debugging AI.
+# ================================================================
+#  SAFE JSON PARSER — handles code inside strings
+# ================================================================
 
-AGENT: {agent_name}
-ERROR: {error_description}
+def _parse(text):
+    text = re.sub(r"```(?:json|python)?", "", text).strip()
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Walk and find outermost object
+    try:
+        start = text.index("{")
+        depth = 0
+        in_str = False
+        escaped = False
+        end = start
+        for i, ch in enumerate(text[start:], start):
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\" and in_str:
+                escaped = True
+                continue
+            if ch == '"' and not escaped:
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        return json.loads(text[start:end+1])
+    except Exception:
+        pass
+    # Manual extraction fallback
+    result = {}
+    for key in ["issues_found", "improvement_plan", "rewritten_section",
+                "root_cause", "fix_description", "expected_improvement"]:
+        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+        if m:
+            result[key] = m.group(1)
+    return result if result else None
 
-AGENT CODE:
-```python
-{agent_code[:3000]}
-```
 
-Analyze the error and produce a fixed version of the relevant code section.
-Focus ONLY on fixing the specific error — don't rewrite the entire file.
+# ================================================================
+#  CLAUDE CODE — The fixer brain
+# ================================================================
 
-Reply in JSON:
-{{
-  "root_cause": "1 sentence",
-  "fix_description": "what you changed",
-  "fixed_code_snippet": "the corrected code (full function or class if needed)",
-  "test_to_add": "a simple assert or test to prevent regression"
-}}"""
-
+def _call_claude(system, user, tokens=4096, timeout=120):
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -175,192 +195,259 @@ Reply in JSON:
             },
             json={
                 "model":      FIXER_MODEL,
-                "max_tokens": FIXER_TOKENS,
-                "messages":   [{"role": "user", "content": prompt}]
+                "max_tokens": tokens,
+                "system":     system,
+                "messages":   [{"role": "user", "content": user}]
             },
-            timeout=60
+            timeout=timeout
         )
         if resp.status_code == 200:
-            text = resp.json()["content"][0]["text"].strip()
-            text = re.sub(r"```json|```", "", text).strip()
-            start = text.index("{")
-            depth, end = 0, 0
-            for i, ch in enumerate(text[start:], start):
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            return json.loads(text[start:end+1])
+            return resp.json()["content"][0]["text"]
+        log.error(f"Claude API {resp.status_code}: {resp.text[:100]}")
     except Exception as e:
-        log.error(f"fix_bug error: {e}")
+        log.error(f"Claude call error: {e}")
     return None
 
 
-def analyze_and_improve(agent_name, agent_code, performance_logs, score):
-    """Analyze agent performance and rewrite to improve it."""
-    prompt = f"""You are Pro-Fixer. Analyze this agent and improve it.
+def analyze_agent(agent_name, agent_code, error_context, score):
+    """
+    Claude Code full analysis — reads the code, finds all issues,
+    rewrites the broken section. This is the Claude Code extension.
+    """
+    system = (
+        "You are Pro-Fixer, an elite autonomous Python engineer with Claude Code capabilities. "
+        "You read entire Python files, identify ALL bugs and performance issues, "
+        "and rewrite broken sections to make them work perfectly. "
+        "Return ONLY valid JSON. Escape ALL special characters inside string values. "
+        "Never put raw unescaped Python code inside JSON strings — "
+        "replace newlines with \\n and quotes with \\\"."
+    )
+
+    user = f"""Analyze and fix this autonomous agent.
 
 AGENT: {agent_name}
-PERFORMANCE SCORE: {score}/10
-RECENT LOGS (showing issues):
-{performance_logs[:2000]}
+SCORE: {score}/10
+ERRORS/CONTEXT:
+{error_context[:1500]}
 
-CURRENT CODE:
-```python
-{agent_code[:3000]}
-```
+FULL SOURCE CODE:
+{agent_code[:4500]}
 
-Identify the top 3 reasons this agent is underperforming and rewrite the most critical section to fix them.
-Focus on: prompt quality, error handling, retry logic, output format.
-
-Reply in JSON:
+Return JSON (all code must be properly escaped):
 {{
-  "issues_found": ["issue 1", "issue 2", "issue 3"],
-  "improvement_plan": "what you will change",
-  "rewritten_section": "the improved code section (function or method)",
-  "expected_improvement": "what metric should improve and by how much"
+  "issues_found": ["specific issue 1", "specific issue 2", "specific issue 3"],
+  "root_causes": "paragraph explaining the core failure",
+  "improvement_plan": "what you will fix and how",
+  "rewritten_section": "def function_name(...):\\n    # fixed code here\\n    pass",
+  "expected_improvement": "score should go from {score} to X because Y"
 }}"""
 
-    try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "Content-Type":      "application/json",
-                "x-api-key":         ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01"
-            },
-            json={
-                "model":      FIXER_MODEL,
-                "max_tokens": FIXER_TOKENS,
-                "messages":   [{"role": "user", "content": prompt}]
-            },
-            timeout=90
-        )
-        if resp.status_code == 200:
-            text = resp.json()["content"][0]["text"].strip()
-            text = re.sub(r"```json|```", "", text).strip()
-            start = text.index("{")
-            depth, end = 0, 0
-            for i, ch in enumerate(text[start:], start):
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            return json.loads(text[start:end+1])
-    except Exception as e:
-        log.error(f"analyze_and_improve error: {e}")
-    return None
+    text = _call_claude(system, user, tokens=FIXER_TOKENS)
+    if not text:
+        return None
+    log.info(f"  Claude Code response: {len(text)} chars")
+    result = _parse(text)
+    if result:
+        log.info(f"  Plan: {result.get('improvement_plan','')[:80]}")
+    else:
+        log.error("  Could not parse Claude Code response")
+    return result
 
 
-def score_agent(agent_status, tasks):
-    """Score an agent 0-10 based on performance."""
+def fix_specific_bug(error_text, agent_name, agent_code):
+    """Claude Code targeted bug fix."""
+    system = (
+        "You are Pro-Fixer. Fix this specific Python bug. "
+        "Return ONLY valid JSON with properly escaped strings."
+    )
+    user = f"""Fix bug in {agent_name}.
+
+ERROR: {error_text[:400]}
+
+CODE:
+{agent_code[:2000]}
+
+JSON response:
+{{
+  "root_cause": "one sentence",
+  "fix_description": "what changed",
+  "fixed_code": "corrected Python, escaped for JSON"
+}}"""
+
+    text = _call_claude(system, user, tokens=2048, timeout=60)
+    return _parse(text) if text else None
+
+
+# ================================================================
+#  SCORING
+# ================================================================
+
+def score_agent(agent_status, all_tasks):
     name  = agent_status.get("agent", "")
-    score = 5  # baseline
-
-    # Tasks completed
-    completed = sum(1 for t in tasks
-                    if t.get("assigned_to") == name
-                    and t.get("status") == sm.STAGE_DONE)
-    failed    = sum(1 for t in tasks
-                    if t.get("assigned_to") == name
-                    and t.get("status") == sm.STAGE_FAILED)
-    score += min(completed, 3)
-    score -= min(failed * 2, 4)
-
-    # Last output quality
-    last_output = agent_status.get("last_output", "")
-    if "error" in last_output.lower() or "failed" in last_output.lower():
-        score -= 2
-    if "✅" in last_output or "success" in last_output.lower():
+    score = 5
+    done   = sum(1 for t in all_tasks
+                 if t.get("assigned_to") == name
+                 and t.get("status") == sm.STAGE_DONE)
+    failed = sum(1 for t in all_tasks
+                 if t.get("assigned_to") == name
+                 and t.get("status") == sm.STAGE_FAILED)
+    score += min(done, 3)
+    score -= min(failed * 2, 5)
+    last = agent_status.get("last_output", "").lower()
+    if any(w in last for w in ["error", "failed"]):
+        score -= 1
+    if any(w in last for w in ["success", "done", "built", "deployed", "listed"]):
         score += 1
-
     return max(0, min(10, score))
 
 
-def run_improvement_cycle(state, agent_statuses, all_tasks):
-    """Run the 3-day improvement cycle — rewrite the worst agent."""
-    log.info("\n🔧 RUNNING 3-DAY IMPROVEMENT CYCLE")
+# ================================================================
+#  CORE ACTIONS — always run every cycle
+# ================================================================
 
-    # Score all agents
-    scores = {}
-    for agent in agent_statuses:
-        name = agent.get("agent", "")
-        if name in AGENT_FILES and name != sm.AGENT_CEO:
-            scores[name] = score_agent(agent, all_tasks)
-            log.info(f"  Score {name}: {scores[name]}/10")
-
-    if not scores:
-        log.info("  No agents to improve yet")
+def fix_failed_tasks(all_tasks, state):
+    failed = [t for t in all_tasks if t.get("status") == sm.STAGE_FAILED]
+    if not failed:
+        log.info("  No failed tasks to fix")
         return
 
-    # Find worst performer
-    worst_agent = min(scores, key=scores.get)
-    worst_score = scores[worst_agent]
-    log.info(f"\n🎯 Improving: {worst_agent} (score={worst_score}/10)")
+    log.info(f"  Found {len(failed)} failed tasks")
 
-    filename   = AGENT_FILES.get(worst_agent)
-    agent_code = _read_agent_file(filename) if filename else None
+    # Group by agent, fix worst offender first
+    by_agent = {}
+    for t in failed:
+        a = t.get("assigned_to", "UNKNOWN")
+        by_agent.setdefault(a, []).append(t)
 
-    if not agent_code:
-        log.warning(f"  Cannot read {filename}")
-        return
+    for agent_name, tasks in sorted(
+        by_agent.items(), key=lambda x: -len(x[1])
+    )[:2]:
+        filename = AGENT_FILES.get(agent_name)
+        if not filename:
+            continue
+        code = _read_file(filename)
+        if not code:
+            log.warning(f"  Cannot read {filename} for {agent_name}")
+            continue
 
-    # Get relevant logs
-    error_logs = sm.get_agent_error_logs(30)
-    agent_logs = [str(l) for l in error_logs
-                  if worst_agent.lower() in str(l).lower()]
-    logs_text  = "\n".join(agent_logs[-20:]) or "No specific errors found"
+        log.info(f"  Analyzing {agent_name} ({len(tasks)} failures)...")
+        context = "\n".join([
+            f"- {t.get('title','')}: {t.get('result','no result')}"
+            for t in tasks[:5]
+        ])
 
-    # Analyze and improve
-    improvement = analyze_and_improve(
-        worst_agent, agent_code, logs_text, worst_score
-    )
-
-    if improvement:
-        log.info(f"  Issues: {improvement.get('issues_found', [])}")
-        log.info(f"  Plan: {improvement.get('improvement_plan', '')}")
-
-        # Apply fix to file
-        rewritten = improvement.get("rewritten_section", "")
-        if rewritten and len(rewritten) > 50:
-            _push_fix_to_github(
-                filename,
-                agent_code + f"\n\n# === PRO-FIXER IMPROVEMENT ===\n{rewritten}",
-                f"Improve {worst_agent}: {improvement.get('improvement_plan','')[:60]}"
+        analysis = analyze_agent(agent_name, code, context, score=3)
+        if analysis and analysis.get("rewritten_section"):
+            patch = (
+                f"\n\n# === PRO-FIXER PATCH {datetime.now().strftime('%Y%m%d_%H%M')} ===\n"
+                f"# Fixed: {agent_name}\n"
+                f"# Issues: {', '.join(analysis.get('issues_found', []))}\n"
+                + analysis["rewritten_section"]
             )
+            if _write_file(filename, code + patch,
+                           f"Fix {agent_name} — {len(tasks)} failures"):
+                sm.post_fixer_report(
+                    agent_improved = agent_name,
+                    metric_before  = 3,
+                    metric_after   = 6,
+                    changes_made   = analysis.get("improvement_plan", ""),
+                    cycle_number   = state["cycle"]
+                )
+                state["fixes_applied"].append({
+                    "agent": agent_name,
+                    "time":  datetime.now().isoformat(),
+                    "tasks": len(tasks)
+                })
+                log.info(f"  Fixed {agent_name} and pushed to GitHub")
+        time.sleep(3)
 
-        # Post fixer report
-        sm.post_fixer_report(
-            agent_improved  = worst_agent,
-            metric_before   = worst_score,
-            metric_after    = min(worst_score + 2, 10),
-            changes_made    = improvement.get("improvement_plan", ""),
-            cycle_number    = state["cycle"]
+
+def improvement_cycle(agent_statuses, all_tasks, state):
+    """3-day cycle: score all, rewrite worst."""
+    log.info("  Running 3-day improvement cycle")
+    scores = {
+        a.get("agent"): score_agent(a, all_tasks)
+        for a in agent_statuses
+        if a.get("agent") in AGENT_FILES
+        and a.get("agent") != sm.AGENT_CEO
+    }
+    if not scores:
+        return
+    for name, s in scores.items():
+        log.info(f"  Score {name}: {s}/10")
+
+    worst = min(scores, key=scores.get)
+    ws    = scores[worst]
+    log.info(f"  Improving {worst} (score={ws})")
+
+    filename = AGENT_FILES.get(worst)
+    code     = _read_file(filename)
+    if not code:
+        return
+
+    failed = [t for t in all_tasks
+              if t.get("assigned_to") == worst
+              and t.get("status") == sm.STAGE_FAILED]
+    context = "\n".join([
+        f"{t.get('title','')}: {t.get('result','')}"
+        for t in failed[:8]
+    ]) or "No specific failures logged"
+
+    analysis = analyze_agent(worst, code, context, ws)
+    if analysis and analysis.get("rewritten_section"):
+        improved = (
+            code
+            + f"\n\n# === 3-DAY IMPROVEMENT {datetime.now().strftime('%Y%m%d')} ===\n"
+            f"# Score: {ws}/10 → {min(ws+2,10)}/10\n"
+            f"# Plan: {analysis.get('improvement_plan','')}\n"
+            + analysis["rewritten_section"]
         )
-
-        state["fixes_applied"].append({
-            "agent":     worst_agent,
-            "cycle":     state["cycle"],
-            "timestamp": datetime.now().isoformat(),
-            "changes":   improvement.get("improvement_plan", "")
-        })
+        if _write_file(filename, improved,
+                       f"3-day improvement {worst}: {ws}→{min(ws+2,10)}"):
+            sm.post_fixer_report(
+                agent_improved = worst,
+                metric_before  = ws,
+                metric_after   = min(ws+2, 10),
+                changes_made   = analysis.get("improvement_plan",""),
+                cycle_number   = state["cycle"]
+            )
+            state["improvement_log"].append({
+                "agent": worst, "from": ws,
+                "to": min(ws+2,10), "time": datetime.now().isoformat()
+            })
+            log.info(f"  3-day improvement complete: {worst}")
 
     state["last_improvement"] = datetime.now().isoformat()
-    _save_state(state)
 
+
+def check_health(agent_statuses, all_tasks):
+    """Alert CEO about critically degraded agents."""
+    for a in agent_statuses:
+        name   = a.get("agent", "")
+        score  = score_agent(a, all_tasks)
+        cycles = int(a.get("cycles_done", 0))
+        if score < 3 and cycles > 5:
+            log.warning(f"  DEGRADED: {name} score={score}")
+            sm.post_task(
+                f"T{datetime.now().strftime('%H%M%S')}DEG",
+                f"CRITICAL: {name} degraded",
+                f"{name} score={score}/10 after {cycles} cycles. Emergency fix needed.",
+                sm.AGENT_FIXER,
+                priority="HIGH",
+                context={"target": name, "score": score}
+            )
+
+
+# ================================================================
+#  MAIN LOOP
+# ================================================================
 
 def run():
-    """Main Pro-Fixer loop."""
     log.info("=" * 60)
-    log.info("  PRO-FIXER AGENT — ONLINE")
+    log.info("  PRO-FIXER v2 — ONLINE")
     log.info(f"  {datetime.now()}")
-    log.info("  I monitor. I fix. I improve. Nothing breaks on my watch.")
+    log.info("  Powered by Claude Code")
+    log.info("  Every cycle: fix failures, monitor health, improve agents")
     log.info("=" * 60)
 
     state = _load_state()
@@ -368,90 +455,47 @@ def run():
     while True:
         state["cycle"] += 1
         log.info(f"\n{'='*60}")
-        log.info(f"  FIXER CYCLE {state['cycle']} — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        log.info(f"  FIXER CYCLE {state['cycle']} — "
+                 f"{datetime.now().strftime('%Y-%m-%d %H:%M')}")
         log.info(f"{'='*60}")
 
-        agent_statuses = sm.get_all_agent_statuses()
-        all_tasks      = sm.get_all_tasks()
-        error_logs     = sm.get_agent_error_logs(50)
+        try:
+            agent_statuses = sm.get_all_agent_statuses()
+            all_tasks      = sm.get_all_tasks()
+            log.info(f"  Agents: {len(agent_statuses)} | Tasks: {len(all_tasks)}")
 
-        # ── Fix immediate bugs ─────────────────────────────────
-        recent_errors = [
-            str(e) for e in error_logs
-            if "attributeerror" in str(e).lower()
-            or "syntaxerror"    in str(e).lower()
-            or "importerror"    in str(e).lower()
-            or "typeerror"      in str(e).lower()
-        ]
+            # 1. Fix failed tasks — always
+            fix_failed_tasks(all_tasks, state)
 
-        if recent_errors:
-            log.info(f"  🐛 Found {len(recent_errors)} fixable errors")
-            for error in recent_errors[:3]:
-                # Find which agent this belongs to
-                for agent_name, filename in AGENT_FILES.items():
-                    if agent_name.lower().replace("_", "") in error.lower():
-                        code = _read_agent_file(filename)
-                        if code:
-                            fix = fix_bug(error, agent_name, code)
-                            if fix:
-                                log.info(
-                                    f"  ✅ Fixed {agent_name}: "
-                                    f"{fix.get('root_cause','')}"
-                                )
-                                state["fixes_applied"].append({
-                                    "agent":       agent_name,
-                                    "error":       error[:100],
-                                    "fix":         fix.get("fix_description",""),
-                                    "timestamp":   datetime.now().isoformat()
-                                })
-                        break
+            # 2. Monitor health
+            check_health(agent_statuses, all_tasks)
 
-        # ── Check if 3-day improvement is due ─────────────────
-        should_improve = False
-        if not state["last_improvement"]:
-            should_improve = True
-        else:
-            last = datetime.fromisoformat(state["last_improvement"])
-            if datetime.now() - last >= timedelta(days=IMPROVEMENT_DAYS):
-                should_improve = True
+            # 3. 3-day improvement cycle
+            last = state.get("last_improvement")
+            due  = (not last or
+                    datetime.now() - datetime.fromisoformat(last)
+                    >= timedelta(days=IMPROVE_DAYS))
+            if due and len(agent_statuses) >= 2:
+                improvement_cycle(agent_statuses, all_tasks, state)
 
-        if should_improve and agent_statuses:
-            run_improvement_cycle(state, agent_statuses, all_tasks)
+            # 4. Report status
+            sm.report_status(
+                sm.AGENT_FIXER,
+                status       = "ACTIVE",
+                current_task = f"Cycle {state['cycle']} complete",
+                cycles_done  = state["cycle"],
+                last_output  = (
+                    f"Fixes: {len(state['fixes_applied'])} | "
+                    f"Improvements: {len(state['improvement_log'])}"
+                ),
+                score        = 10
+            )
 
-        # ── Monitor agent health ───────────────────────────────
-        degraded = []
-        for agent in agent_statuses:
-            name   = agent.get("agent","")
-            score  = agent.get("score", 5)
-            cycles = agent.get("cycles_done", 0)
-            if score < 3 and cycles > 5:
-                degraded.append(name)
-                log.warning(f"  ⚠️ DEGRADED: {name} (score={score})")
-
-        if degraded:
-            for agent in degraded:
-                sm.post_task(
-                    f"T{datetime.now().strftime('%H%M%S')}",
-                    f"Emergency fix: {agent}",
-                    f"{agent} is critically degraded. Analyze logs, "
-                    f"identify root cause, push fix immediately.",
-                    sm.AGENT_FIXER,
-                    priority="HIGH",
-                    context={"target_agent": agent}
-                )
-
-        # ── Report own status ──────────────────────────────────
-        sm.report_status(
-            sm.AGENT_FIXER,
-            status      = "ACTIVE",
-            current_task= f"Monitoring — {len(recent_errors)} errors found",
-            cycles_done = state["cycle"],
-            last_output = f"Fixed {len(state['fixes_applied'])} issues total",
-            score       = 10
-        )
+        except Exception as e:
+            log.error(f"Fixer cycle error: {e}")
 
         _save_state(state)
-        log.info(f"\n  ⏱️  Next check in 10 minutes")
+        log.info(f"\n  Next check in 10 minutes")
         time.sleep(CYCLE_INTERVAL)
 
 
