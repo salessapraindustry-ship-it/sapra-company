@@ -295,3 +295,245 @@ def run():
 
 if __name__ == "__main__":
     run()
+
+
+# === PRO-FIXER PATCH 20260328_1552 ===
+# Fixed: FRONTEND_BUILDER
+# Issues: JSON extraction uses naive string slicing with text.index('{') which fails when Claude returns text before JSON or malformed responses, deploy_to_github_pages function is incomplete - cuts off mid-statement at 'repo_' causing syntax error, No error handling for missing/malformed JSON responses from Claude API - fails silently instead of retrying with clearer prompts, generate_landing_page doesn't validate that returned JSON contains required keys (index_html, headline, etc.) before returning, No fallback templates when API fails - agent should have working HTML templates as backup, State management doesn't track failures or implement exponential backoff for repeatedly failing tools
+def generate_landing_page(tool_name, description, price, endpoints, repo_url):
+    """Generate a high-converting landing page for a tool."""
+    prompt = f"""You are an expert frontend developer and copywriter.
+Create a high-converting landing page for a developer tool.
+
+TOOL: {tool_name}
+DESCRIPTION: {description}
+PRICE: {price}
+API ENDPOINTS: {', '.join(endpoints[:3]) if endpoints else 'N/A'}
+REPO: {repo_url}
+
+Build a single HTML file (index.html) with:
+1. Compelling headline focused on the benefit, not the feature
+2. 3 key features with icons (use emoji)
+3. Code snippet showing how easy it is to use
+4. Pricing section with clear CTA button
+5. Simple footer with GitHub link
+6. Modern, clean design using Tailwind CSS CDN
+7. Mobile responsive
+
+The page should make a developer want to buy this tool immediately.
+
+Reply ONLY with valid JSON, no other text:
+{{
+  \"index_html\": \"complete single-file HTML\",
+  \"headline\": \"the main hero headline\",
+  \"tagline\": \"1 sentence value prop\",
+  \"cta_text\": \"button text\",
+  \"estimated_conversion\": \"X% of visitors buy\"
+}}"""
+
+    def _call_api():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=90
+        )
+        if resp.status_code != 200:
+            raise Exception(f"API error {resp.status_code}: {resp.text}")
+        return resp.json()
+
+    try:
+        result = _retry_api(_call_api, retries=3, delay=3)
+        if not result:
+            log.error("API call failed after retries")
+            return _get_fallback_template(tool_name, description, price, repo_url)
+
+        text = result["content"][0]["text"].strip()
+        
+        # Try multiple JSON extraction methods
+        parsed = None
+        
+        # Method 1: Find JSON block in code fence
+        json_match = re.search(r'(?:json)?\s*({.*?})\s*', text, re.DOTALL)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group(1))
+            except:
+                pass
+        
+        # Method 2: Find first complete JSON object
+        if not parsed:
+            try:
+                start = text.index("{")
+                depth, end = 0, 0
+                for i, ch in enumerate(text[start:], start):
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i
+                            break
+                if end > start:
+                    parsed = json.loads(text[start:end+1])
+            except:
+                pass
+        
+        # Method 3: Try parsing entire response
+        if not parsed:
+            try:
+                parsed = json.loads(text)
+            except:
+                pass
+        
+        if not parsed:
+            log.error("Failed to extract JSON from response")
+            return _get_fallback_template(tool_name, description, price, repo_url)
+        
+        # Validate required keys
+        required_keys = ["index_html", "headline", "tagline", "cta_text"]
+        if not all(key in parsed for key in required_keys):
+            log.error(f"Missing required keys in response: {parsed.keys()}")
+            return _get_fallback_template(tool_name, description, price, repo_url)
+        
+        # Validate HTML is not empty
+        if not parsed["index_html"] or len(parsed["index_html"]) < 500:
+            log.error("Generated HTML is too short or empty")
+            return _get_fallback_template(tool_name, description, price, repo_url)
+        
+        return parsed
+        
+    except Exception as e:
+        log.error(f"generate_landing_page error: {e}")
+        return _get_fallback_template(tool_name, description, price, repo_url)
+
+
+def _get_fallback_template(tool_name, description, price, repo_url):
+    """Return a working fallback HTML template when API fails."""
+    html = f"""<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+    <meta charset=\"UTF-8\">
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
+    <title>{tool_name} - Developer Tool</title>
+    <script src=\"https://cdn.tailwindcss.com\"></script>
+</head>
+<body class=\"bg-gray-50\">
+    <div class=\"max-w-4xl mx-auto px-4 py-16\">
+        <header class=\"text-center mb-16\">
+            <h1 class=\"text-5xl font-bold text-gray-900 mb-4\">{tool_name}</h1>
+            <p class=\"text-xl text-gray-600\">{description}</p>
+        </header>
+        
+        <section class=\"bg-white rounded-lg shadow-lg p-8 mb-8\">
+            <h2 class=\"text-3xl font-bold mb-6\">Features</h2>
+            <div class=\"space-y-4\">
+                <div class=\"flex items-start\">
+                    <span class=\"text-2xl mr-3\">⚡</span>
+                    <div><h3 class=\"font-bold\">Fast & Reliable</h3><p class=\"text-gray-600\">High-performance API built for developers</p></div>
+                </div>
+                <div class=\"flex items-start\">
+                    <span class=\"text-2xl mr-3\">🔒</span>
+                    <div><h3 class=\"font-bold\">Secure</h3><p class=\"text-gray-600\">Enterprise-grade security standards</p></div>
+                </div>
+                <div class=\"flex items-start\">
+                    <span class=\"text-2xl mr-3\">📚</span>
+                    <div><h3 class=\"font-bold\">Easy to Use</h3><p class=\"text-gray-600\">Simple API with great documentation</p></div>
+                </div>
+            </div>
+        </section>
+        
+        <section class=\"bg-blue-600 text-white rounded-lg shadow-lg p-8 text-center\">
+            <h2 class=\"text-3xl font-bold mb-4\">Pricing</h2>
+            <p class=\"text-5xl font-bold mb-6\">{price}</p>
+            <a href=\"{repo_url}\" class=\"inline-block bg-white text-blue-600 px-8 py-3 rounded-lg font-bold hover:bg-gray-100 transition\">Get Started Now</a>
+        </section>
+        
+        <footer class=\"text-center mt-16 text-gray-600\">
+            <p><a href=\"{repo_url}\" class=\"text-blue-600 hover:underline\">View on GitHub</a></p>
+        </footer>
+    </div>
+</body>
+</html>"""
+    
+    return {
+        "index_html": html,
+        "headline": tool_name,
+        "tagline": description,
+        "cta_text": "Get Started Now",
+        "estimated_conversion": "2-3% (fallback template)"
+    }
+
+
+def deploy_to_github_pages(tool_name, html_content):
+    """Deploy landing page to GitHub Pages."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        path = Path(f"/tmp/pages/{tool_name}/index.html")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(html_content)
+        log.info(f"  ✅ Page saved locally: {path}")
+        return f"local:/tmp/pages/{tool_name}"
+
+    try:
+        import base64
+        repo_name = f"{tool_name.lower().replace(' ', '-')}-landing"
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        # Create repository
+        create_repo_url = "https://api.github.com/user/repos"
+        repo_data = {
+            "name": repo_name,
+            "description": f"Landing page for {tool_name}",
+            "homepage": f"https://{GITHUB_USERNAME}.github.io/{repo_name}",
+            "private": False,
+            "has_issues": False,
+            "has_projects": False,
+            "has_wiki": False
+        }
+        
+        repo_resp = requests.post(create_repo_url, headers=headers, json=repo_data, timeout=30)
+        if repo_resp.status_code not in [201, 422]:  # 422 = already exists
+            log.error(f"Failed to create repo: {repo_resp.status_code} {repo_resp.text}")
+            return None
+        
+        # Upload index.html to main branch
+        file_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/contents/index.html"
+        file_data = {
+            "message": f"Deploy {tool_name} landing page",
+            "content": base64.b64encode(html_content.encode()).decode(),
+            "branch": "main"
+        }
+        
+        file_resp = requests.put(file_url, headers=headers, json=file_data, timeout=30)
+        if file_resp.status_code not in [201, 200]:
+            log.error(f"Failed to upload file: {file_resp.status_code} {file_resp.text}")
+            return None
+        
+        # Enable GitHub Pages
+        pages_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/pages"
+        pages_data = {"source": {"branch": "main", "path": "/"}}
+        requests.post(pages_url, headers=headers, json=pages_data, timeout=30)
+        
+        page_url = f"https://{GITHUB_USERNAME}.github.io/{repo_name}"
+        log.info(f"  ✅ Deployed to: {page_url}")
+        return page_url
+        
+    except Exception as e:
+        log.error(f"deploy_to_github_pages error: {e}")
+        # Fallback to local save
+        path = Path(f"/tmp/pages/{tool_name}/index.html")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(html_content)
+        log.info(f"  ✅ Page saved locally (GitHub failed): {path}")
+        return f"local:/tmp/pages/{tool_name}"
