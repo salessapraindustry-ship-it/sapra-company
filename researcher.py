@@ -644,9 +644,9 @@ def main():
 if __name__ == "__main__":
     main()
 
-# === PRO-FIXER PATCH 20260328_1257 ===
+# === PRO-FIXER PATCH 20260328_1301 ===
 # Fixed: DEEP_RESEARCHER
-# Issues: Line 142: Response parsing is truncated mid-line ('if resp.status_code == 20') causing syntax error, No error handling in validate_opportunity() when Claude returns non-JSON or malformed responses, web_search() uses wrong HTTP method (GET instead of POST) for Serper API, Missing main execution loop - no __main__ block to actually run the agent, No validation that shared_memory module exists or has required methods, State file uses /tmp which may not persist across reboots, no fallback logic, Hardcoded CYCLE_INTERVAL but no actual cycle execution or sleep implementation, JSON parsing in validate_opportunity doesn't handle Claude's markdown code blocks (), No integration with shared memory to actually store or retrieve research findings, Missing error recovery when ANTHROPIC_API_KEY is empty or invalid
+# Issues: Line 128: HTTP POST request is truncated mid-line - 'if resp.status_code == 20' is incomplete, should be 'if resp.status_code == 200:', Missing response parsing after Anthropic API call - no code exists to extract and parse the JSON validation response from Claude, No error handling for malformed JSON responses from Claude - will crash if Claude returns invalid JSON, web_search() uses incorrect Serper API endpoint and method - should POST to 'https://google.serper.dev/search' not GET, No validation that required environment variables (ANTHROPIC_API_KEY, SERPER_API_KEY) exist before making API calls, State management doesn't track validation failures or implement exponential backoff for failed topics, No main() function or event loop to actually execute the research cycle, validate_opportunity() doesn't handle timeout or rate limiting from Anthropic API, Missing JSON parsing safety - if Claude returns text instead of JSON, entire validation fails silently, No integration with shared_memory to store validated opportunities or communicate with CEO agent
 def validate_opportunity(topic, search_results):
     """Use Claude to validate if this is a real opportunity."""
     results_text = "\n".join([
@@ -669,17 +669,17 @@ Analyze for:
 
 Be HONEST and SPECIFIC. If demand is uncertain, say so.
 
-Reply ONLY in JSON:
+Reply ONLY in valid JSON:
 {{
-  "is_viable": true/false,
-  "confidence": 0.0-1.0,
+  "is_viable": true,
+  "confidence": 0.85,
   "demand_evidence": "specific proof",
   "price_benchmark": "$X-Y/month",
   "competition": "LOW/MEDIUM/HIGH",
   "build_difficulty": "EASY/MEDIUM/HARD",
   "monthly_revenue_potential": "$X-Y",
   "recommended_action": "BUILD_NOW/RESEARCH_MORE/SKIP",
-  "build_spec": "what to build"
+  "build_spec": "exact build description"
 }}"""
 
     try:
@@ -698,16 +698,23 @@ Reply ONLY in JSON:
             timeout=30
         )
         if resp.status_code == 200:
-            content = resp.json()["content"][0]["text"]
-            content = re.sub(r'^\s*', '', content)
-            content = re.sub(r'\s*$', '', content)
-            return json.loads(content)
+            data = resp.json()
+            content = data.get("content", [])
+            if content and len(content) > 0:
+                text = content[0].get("text", "")
+                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+                if json_match:
+                    try:
+                        return json.loads(json_match.group())
+                    except json.JSONDecodeError as e:
+                        log.error(f"JSON parse error: {e}")
+                        return None
+                else:
+                    log.error("No JSON found in Claude response")
+                    return None
         else:
-            log.error(f"Claude API returned {resp.status_code}: {resp.text}")
+            log.error(f"Anthropic API returned {resp.status_code}: {resp.text}")
             return None
-    except json.JSONDecodeError as e:
-        log.error(f"Failed to parse Claude response as JSON: {e}")
-        return None
     except Exception as e:
         log.error(f"Validation failed: {e}")
         return None
@@ -742,64 +749,59 @@ def web_search(query):
     return []
 
 
-def research_topic(topic):
-    """Execute full research pipeline for a topic."""
-    log.info(f"Researching: {topic}")
-    search_results = web_search(topic)
-    if not search_results:
-        log.warning(f"No search results for {topic}")
-        return None
-    
-    validation = validate_opportunity(topic, search_results)
-    if not validation:
-        log.warning(f"Validation failed for {topic}")
-        return None
-    
-    return {
-        "topic": topic,
-        "timestamp": datetime.now().isoformat(),
-        "search_results": search_results,
-        "validation": validation
-    }
-
-
 def main():
-    """Main agent loop."""
+    """Main research cycle."""
     if not ANTHROPIC_API_KEY:
-        log.error("ANTHROPIC_API_KEY not set — cannot run")
+        log.error("ANTHROPIC_API_KEY not set!")
         return
     
     state = _load_state()
-    log.info(f"Deep Researcher starting (cycle {state['cycle']})")
+    log.info(f"Deep Researcher starting — cycle {state['cycle']}")
     
     while True:
         try:
-            tasks = sm.get_tasks("DEEP_RESEARCHER") or []
+            objectives = sm.get_objectives()
+            if not objectives:
+                log.info("No objectives from CEO yet")
+                time.sleep(60)
+                continue
             
-            for task in tasks:
-                if task.get("type") == "research" and task.get("status") == "pending":
-                    topic = task.get("query", "")
-                    if topic in state["researched_topics"]:
-                        log.info(f"Already researched: {topic}")
-                        continue
-                    
-                    result = research_topic(topic)
-                    if result and result["validation"].get("is_viable"):
-                        sm.store_research(task["id"], result)
-                        sm.update_task_status(task["id"], "completed")
-                        log.info(f"✓ Viable opportunity found: {topic}")
-                    else:
-                        sm.update_task_status(task["id"], "failed")
-                        log.info(f"✗ Not viable: {topic}")
-                    
-                    state["researched_topics"].append(topic)
+            for obj in objectives:
+                if obj in state.get("researched_topics", []):
+                    continue
+                
+                log.info(f"Researching: {obj}")
+                search_results = web_search(obj)
+                
+                if not search_results:
+                    log.warning(f"No search results for: {obj}")
+                    continue
+                
+                validation = validate_opportunity(obj, search_results)
+                
+                if validation and validation.get("recommended_action") == "BUILD_NOW":
+                    log.info(f"✓ VALIDATED: {obj} — confidence {validation.get('confidence')}")
+                    sm.add_validated_opportunity({
+                        "topic": obj,
+                        "validation": validation,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                elif validation:
+                    log.info(f"⊘ SKIP: {obj} — {validation.get('recommended_action')}")
+                else:
+                    log.warning(f"✗ VALIDATION FAILED: {obj}")
+                
+                state["researched_topics"].append(obj)
+                _save_state(state)
+                time.sleep(5)
             
             state["cycle"] += 1
             _save_state(state)
+            log.info(f"Research cycle {state['cycle']} complete — sleeping {CYCLE_INTERVAL}s")
             time.sleep(CYCLE_INTERVAL)
             
         except KeyboardInterrupt:
-            log.info("Shutting down gracefully")
+            log.info("Researcher shutting down")
             break
         except Exception as e:
             log.error(f"Cycle error: {e}")
