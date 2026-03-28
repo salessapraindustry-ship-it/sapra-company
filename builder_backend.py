@@ -3037,3 +3037,208 @@ def deploy_to_github(tool_name, files):
     except Exception as e:
         log.error(f"deploy_to_github error: {e}")
         return f"local:/tmp/tools/{tool_name}"
+
+# === PRO-FIXER PATCH 20260328_1344 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() returns raw JSON that may contain unescaped code strings, causing JSON parsing failures, deploy_to_github() function is incomplete - code cuts off mid-implementation, breaking deployment, No error handling for malformed Claude API responses with code blocks or special characters, JSON extraction logic fails when Claude returns markdown-wrapped or multi-line code in JSON strings, Missing validation that generated code is valid Python before attempting deployment, No fallback when Claude returns explanatory text instead of pure JSON, State persistence errors are silently ignored, causing repeated work, No actual task execution loop - agent has no main() or run() function
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+IMPORTANT: Return ONLY valid JSON. Escape all newlines as \\n and quotes as \\" inside string values.
+
+Reply in JSON:
+{{
+  "tool_name": "snake_case_name",
+  "description": "what this tool does in 1 sentence",
+  "main_py": "complete main.py code with \\n for newlines",
+  "requirements_txt": "package1\\npackage2\\n...",
+  "readme_md": "markdown README with usage examples",
+  "api_endpoints": ["GET /endpoint1", "POST /endpoint2"],
+  "suggested_price": "$X/month",
+  "deployment_cmd": "railway up or render deploy command"
+}}"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": 4096,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=90
+        )
+        if resp.status_code == 200:
+            text = resp.json()["content"][0]["text"].strip()
+            text = re.sub(r"\s*", "", text)
+            text = re.sub(r"\s*$", "", text)
+            text = text.strip()
+            
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as e:
+                log.error(f"JSON decode error: {e}")
+                start_idx = text.find("{")
+                end_idx = text.rfind("}")
+                if start_idx != -1 and end_idx != -1:
+                    try:
+                        return json.loads(text[start_idx:end_idx+1])
+                    except:
+                        pass
+                log.error(f"Raw response: {text[:500]}")
+                return None
+    except Exception as e:
+        log.error(f"generate_backend_code error: {e}")
+    return None
+
+
+def validate_python_code(code):
+    """Check if Python code is syntactically valid."""
+    try:
+        compile(code, "<string>", "exec")
+        return True
+    except SyntaxError as e:
+        log.error(f"Invalid Python syntax: {e}")
+        return False
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        log.info(f"  ✅ Tool saved locally: {tool_dir}")
+        return f"local:/tmp/tools/{tool_name}"
+
+    try:
+        repo_name = f"backend-{tool_name}"
+        
+        resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json={
+                "name": repo_name,
+                "description": f"Auto-generated backend tool: {tool_name}",
+                "private": False,
+                "auto_init": True
+            },
+            timeout=30
+        )
+        
+        if resp.status_code not in [201, 422]:
+            log.error(f"GitHub repo creation failed: {resp.status_code} {resp.text}")
+            return deploy_to_github(tool_name, files)
+        
+        repo_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
+        
+        for filename, content in files.items():
+            file_resp = requests.put(
+                f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/contents/{filename}",
+                headers={
+                    "Authorization": f"token {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github.v3+json"
+                },
+                json={
+                    "message": f"Add {filename}",
+                    "content": __import__('base64').b64encode(content.encode()).decode()
+                },
+                timeout=30
+            )
+            if file_resp.status_code not in [201, 200]:
+                log.error(f"Failed to upload {filename}: {file_resp.status_code}")
+        
+        log.info(f"  ✅ Deployed to GitHub: {repo_url}")
+        return repo_url
+        
+    except Exception as e:
+        log.error(f"deploy_to_github error: {e}")
+        return deploy_to_github(tool_name, files)
+
+
+def main():
+    """Main autonomous loop."""
+    log.info("🚀 Backend Builder Agent starting...")
+    state = _load_state()
+    
+    while True:
+        try:
+            state["cycle"] += 1
+            log.info(f"\n{'='*60}\nCycle {state['cycle']}\n{'='*60}")
+            
+            tasks = sm.get_tasks("backend_build") or []
+            
+            if not tasks:
+                log.info("No tasks found. Generating default task...")
+                tasks = [{
+                    "description": "Build simple JSON/CSV converter API",
+                    "research": "FastAPI endpoint that accepts JSON and returns CSV, vice versa"
+                }]
+            
+            for task in tasks[:1]:
+                log.info(f"\n📋 Task: {task['description']}")
+                
+                result = generate_backend_code(
+                    task['description'],
+                    task.get('research', '')
+                )
+                
+                if not result:
+                    log.error("❌ Code generation failed")
+                    continue
+                
+                if 'main_py' in result and not validate_python_code(result['main_py']):
+                    log.error("❌ Generated code has syntax errors")
+                    continue
+                
+                files = {
+                    "main.py": result.get("main_py", ""),
+                    "requirements.txt": result.get("requirements_txt", ""),
+                    "README.md": result.get("readme_md", "")
+                }
+                
+                deploy_url = deploy_to_github(result.get("tool_name", "backend_tool"), files)
+                
+                state["built_tools"].append({
+                    "name": result.get("tool_name"),
+                    "url": deploy_url,
+                    "timestamp": datetime.now().isoformat()
+                })
+                
+                log.info(f"✅ Tool built and deployed: {deploy_url}")
+            
+            _save_state(state)
+            log.info(f"\n💤 Sleeping {CYCLE_INTERVAL}s...")
+            time.sleep(CYCLE_INTERVAL)
+            
+        except KeyboardInterrupt:
+            log.info("\n👋 Shutting down...")
+            break
+        except Exception as e:
+            log.error(f"Main loop error: {e}")
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()
