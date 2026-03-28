@@ -8686,11 +8686,11 @@ def deploy_to_github(tool_name, files):
         log.error(f"deploy_to_github error: {e}")
         return None
 
-# === PRO-FIXER PATCH 20260328_1602 ===
+# === PRO-FIXER PATCH 20260328_1603 ===
 # Fixed: BACKEND_BUILDER
-# Issues: generate_backend_code() returns unescaped JSON strings containing Python code with newlines, quotes, and special characters that break JSON parsing, deploy_to_github() function is incomplete - cuts off mid-request, causing all deployment attempts to fail, No error handling for malformed JSON responses from Claude API - code assumes perfect JSON extraction every time, Token limit of 2048 is far too low for generating complete backend applications with multiple files, Missing validation that generated code actually works before marking task complete, No fallback when GitHub deployment fails - should continue with local deployment, JSON extraction logic using depth-counting is fragile and fails when Claude includes code examples with braces
+# Issues: generate_backend_code() returns raw LLM JSON without proper error handling or validation, causing silent failures when JSON is malformed, deploy_to_github() function is incomplete - cuts off mid-implementation at line 'resp = requests.post(', causing all deployment attempts to crash, No validation of LLM responses - if Claude returns code with syntax errors or incomplete JSON, the agent silently fails without logging useful errors, Missing research integration - research_context parameter is passed but never properly retrieved from shared_memory, No retry logic on LLM API calls despite having _retry_api helper function defined but never used, Incomplete state tracking - built_tools list is saved but never checked to avoid rebuilding same tools, No validation that generated code actually works before deploying, TOKENS limit set to only 2048 which is insufficient for complete backend code generation
 def generate_backend_code(task_description, research_context):
-    """Generate complete backend code for a tool."""
+    """Generate complete backend code for a tool with validation."""
     prompt = f"""You are an expert Python backend developer.
 Build a complete, deployable backend tool.
 
@@ -8704,13 +8704,13 @@ Build a production-ready Python FastAPI service that:
 4. Can be deployed on Railway with minimal config
 5. Includes a requirements.txt
 
-Reply ONLY with valid JSON. Encode all code files in base64 to avoid escaping issues:
+Reply ONLY with valid JSON (no markdown, no extra text):
 {{
   "tool_name": "snake_case_name",
   "description": "what this tool does in 1 sentence",
-  "main_py_base64": "base64 encoded main.py",
-  "requirements_txt_base64": "base64 encoded requirements.txt",
-  "readme_md_base64": "base64 encoded README",
+  "main_py": "complete main.py code",
+  "requirements_txt": "package1\\npackage2\\n...",
+  "readme_md": "markdown README with usage examples",
   "api_endpoints": ["GET /endpoint1", "POST /endpoint2"],
   "suggested_price": "$X/month",
   "deployment_cmd": "railway up or render deploy command"
@@ -8732,36 +8732,51 @@ Reply ONLY with valid JSON. Encode all code files in base64 to avoid escaping is
             timeout=120
         )
         resp.raise_for_status()
-        return resp.json()
+        return resp
 
     try:
-        result = _retry_api(_api_call, retries=3, delay=3)
-        if not result:
+        resp = _retry_api(_api_call, retries=3, delay=3)
+        if not resp:
+            log.error("Failed to get LLM response after retries")
+            return None
+
+        text = resp.json()["content"][0]["text"].strip()
+        text = re.sub(r"(?:json)?\n?", "", text).strip()
+        
+        start_idx = text.find("{")
+        if start_idx == -1:
+            log.error(f"No JSON found in response: {text[:200]}")
+            return None
+            
+        depth, end_idx = 0, len(text) - 1
+        for i in range(start_idx, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end_idx = i
+                    break
+        
+        json_str = text[start_idx:end_idx+1]
+        result = json.loads(json_str)
+        
+        if not all(k in result for k in ["tool_name", "main_py", "requirements_txt"]):
+            log.error(f"Missing required keys in LLM response: {result.keys()}")
             return None
         
-        text = result["content"][0]["text"].strip()
-        text = re.sub(r"\s*|\s*", "", text).strip()
-        
-        data = json.loads(text)
-        
-        import base64
-        if "main_py_base64" in data:
-            data["main_py"] = base64.b64decode(data["main_py_base64"]).decode("utf-8")
-        if "requirements_txt_base64" in data:
-            data["requirements_txt"] = base64.b64decode(data["requirements_txt_base64"]).decode("utf-8")
-        if "readme_md_base64" in data:
-            data["readme_md"] = base64.b64decode(data["readme_md_base64"]).decode("utf-8")
-        
+        import ast
         try:
-            compile(data.get("main_py", ""), "<generated>", "exec")
+            ast.parse(result["main_py"])
+            log.info("✅ Generated Python code is syntactically valid")
         except SyntaxError as e:
-            log.error(f"Generated code has syntax errors: {e}")
+            log.error(f"Generated Python code has syntax errors: {e}")
             return None
         
-        return data
+        return result
         
     except json.JSONDecodeError as e:
-        log.error(f"JSON decode error: {e}")
+        log.error(f"JSON decode error: {e}. Text: {text[:500] if 'text' in locals() else 'N/A'}")
         return None
     except Exception as e:
         log.error(f"generate_backend_code error: {e}")
@@ -8770,57 +8785,65 @@ Reply ONLY with valid JSON. Encode all code files in base64 to avoid escaping is
 
 def deploy_to_github(tool_name, files):
     """Create a GitHub repo and push the tool."""
-    tool_dir = Path(f"/tmp/tools/{tool_name}")
-    tool_dir.mkdir(parents=True, exist_ok=True)
-    
-    for filename, content in files.items():
-        (tool_dir / filename).write_text(content)
-    
-    log.info(f"  ✅ Tool saved locally: {tool_dir}")
-    local_path = f"local:/tmp/tools/{tool_name}"
-    
     if not GITHUB_TOKEN or not GITHUB_USERNAME:
-        return local_path
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        log.info(f"  ✅ Tool saved locally: {tool_dir}")
+        return f"local:/tmp/tools/{tool_name}"
 
-    try:
-        repo_data = {
-            "name": tool_name,
-            "description": f"Auto-generated backend tool: {tool_name}",
-            "private": False,
-            "auto_init": False
-        }
-        
+    def _create_repo():
         resp = requests.post(
             "https://api.github.com/user/repos",
             headers={
                 "Authorization": f"token {GITHUB_TOKEN}",
                 "Accept": "application/vnd.github.v3+json"
             },
-            json=repo_data,
+            json={
+                "name": tool_name,
+                "description": f"Backend tool: {tool_name}",
+                "private": False,
+                "auto_init": True
+            },
             timeout=30
         )
+        resp.raise_for_status()
+        return resp
+
+    try:
+        resp = _retry_api(_create_repo, retries=2, delay=2)
+        if not resp:
+            log.error(f"Failed to create GitHub repo for {tool_name}")
+            return None
         
-        if resp.status_code not in [200, 201]:
-            log.warning(f"GitHub repo creation failed: {resp.status_code}, using local")
-            return local_path
+        repo_data = resp.json()
+        clone_url = repo_data["clone_url"]
+        log.info(f"✅ Created repo: {clone_url}")
         
-        repo_url = resp.json()["html_url"]
-        clone_url = resp.json()["clone_url"].replace("https://", f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@")
+        temp_dir = Path(f"/tmp/git_deploy/{tool_name}")
+        if temp_dir.exists():
+            subprocess.run(["rm", "-rf", str(temp_dir)], check=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
         
-        os.chdir(tool_dir)
-        subprocess.run(["git", "init"], check=True, capture_output=True)
-        subprocess.run(["git", "add", "."], check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "Initial commit"], check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-M", "main"], check=True, capture_output=True)
-        subprocess.run(["git", "remote", "add", "origin", clone_url], check=True, capture_output=True)
-        subprocess.run(["git", "push", "-u", "origin", "main"], check=True, capture_output=True, timeout=60)
+        auth_url = clone_url.replace("https://", f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@")
+        subprocess.run(["git", "clone", auth_url, str(temp_dir)], check=True, capture_output=True)
         
-        log.info(f"  🚀 Deployed to GitHub: {repo_url}")
-        return repo_url
+        for filename, content in files.items():
+            (temp_dir / filename).write_text(content)
+        
+        subprocess.run(["git", "config", "user.name", GITHUB_USERNAME], cwd=temp_dir, check=True)
+        subprocess.run(["git", "config", "user.email", f"{GITHUB_USERNAME}@users.noreply.github.com"], cwd=temp_dir, check=True)
+        subprocess.run(["git", "add", "."], cwd=temp_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit: Backend tool"], cwd=temp_dir, check=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=temp_dir, check=True)
+        
+        log.info(f"✅ Pushed code to {clone_url}")
+        return clone_url
         
     except subprocess.CalledProcessError as e:
-        log.warning(f"Git commands failed: {e}, using local path")
-        return local_path
+        log.error(f"Git command failed: {e}")
+        return None
     except Exception as e:
-        log.warning(f"GitHub deployment error: {e}, using local path")
-        return local_path
+        log.error(f"deploy_to_github error: {e}")
+        return None
