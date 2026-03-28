@@ -43,7 +43,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 RAPIDAPI_KEY      = os.environ.get("RAPIDAPI_KEY", "")
 MODEL             = "claude-haiku-4-5-20251001"
 TOKENS            = 1024
-CYCLE_INTERVAL    = 1200   # 20 minutes
+CYCLE_INTERVAL    = 1500   # 25 minutes (staggered from CEO's 15min)
 
 state_file = "/tmp/researcher_state.json"
 
