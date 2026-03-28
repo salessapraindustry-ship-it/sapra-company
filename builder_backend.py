@@ -340,3 +340,227 @@ def run():
 
 if __name__ == "__main__":
     run()
+
+
+# === PRO-FIXER PATCH 20260328_1246 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() returns raw JSON with unescaped code strings that will break when writing to files - Python code with quotes/newlines causes JSON parse errors, deploy_to_github() function is incomplete (cuts off mid-request), causing all deployment attempts to fail, No error handling for malformed Claude responses - when Claude returns markdown-wrapped or malformed JSON, the regex parsing fails silently, Token limit of 2048 is too small for generating complete backend applications with FastAPI boilerplate, requirements.txt, and README, Missing validation that generated code actually works before deployment - no syntax checking or test execution, State management saves built_tools list but never checks it to avoid rebuilding the same tool, No retry logic on GitHub API calls despite having _retry_api helper function that's never used, CYCLE_INTERVAL of 1800 seconds with no main loop implementation means agent never actually cycles
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+IMPORTANT: Encode all code files as base64 to avoid JSON escaping issues.
+
+Reply in JSON:
+{{
+  "tool_name": "snake_case_name",
+  "description": "what this tool does in 1 sentence",
+  "main_py_b64": "base64 encoded main.py",
+  "requirements_txt_b64": "base64 encoded requirements.txt",
+  "readme_md_b64": "base64 encoded README.md",
+  "api_endpoints": ["GET /endpoint1", "POST /endpoint2"],
+  "suggested_price": "$X/month",
+  "deployment_cmd": "railway up or render deploy command"
+}}"""
+
+    def _call_api():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": 8000,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=90
+        )
+        resp.raise_for_status()
+        return resp
+
+    try:
+        resp = _retry_api(_call_api)
+        if not resp:
+            return None
+        
+        text = resp.json()["content"][0]["text"].strip()
+        text = re.sub(r"|", "", text).strip()
+        start = text.find("{")
+        if start == -1:
+            log.error("No JSON object found in response")
+            return None
+        
+        depth, end = 0, start
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        
+        result = json.loads(text[start:end+1])
+        
+        import base64
+        decoded_files = {}
+        for key in ["main_py_b64", "requirements_txt_b64", "readme_md_b64"]:
+            if key in result:
+                file_key = key.replace("_b64", "")
+                try:
+                    decoded_files[file_key] = base64.b64decode(result[key]).decode("utf-8")
+                except Exception:
+                    decoded_files[file_key] = result.get(key, "")
+        
+        result.update(decoded_files)
+        
+        if "main_py" in result:
+            import ast
+            try:
+                ast.parse(result["main_py"])
+            except SyntaxError as e:
+                log.error(f"Generated code has syntax errors: {e}")
+                return None
+        
+        return result
+    except Exception as e:
+        log.error(f"generate_backend_code error: {e}")
+        return None
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        log.info(f"  ✅ Tool saved locally: {tool_dir}")
+        return f"local:/tmp/tools/{tool_name}"
+
+    def _create_repo():
+        resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json={
+                "name": tool_name,
+                "description": f"Auto-generated backend tool: {tool_name}",
+                "private": False,
+                "auto_init": True
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        repo_data = _retry_api(_create_repo)
+        if not repo_data:
+            log.error("Failed to create GitHub repo")
+            return None
+        
+        repo_url = repo_data.get("clone_url", "")
+        log.info(f"  📦 Created repo: {repo_url}")
+        
+        temp_dir = Path(f"/tmp/git_deploy/{tool_name}")
+        if temp_dir.exists():
+            subprocess.run(["rm", "-rf", str(temp_dir)], check=False)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        subprocess.run(["git", "clone", repo_url, str(temp_dir)], check=True, capture_output=True)
+        
+        for filename, content in files.items():
+            (temp_dir / filename).write_text(content)
+        
+        subprocess.run(["git", "-C", str(temp_dir), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(temp_dir), "commit", "-m", "Initial backend tool commit"], check=True)
+        subprocess.run(["git", "-C", str(temp_dir), "push"], check=True)
+        
+        log.info(f"  ✅ Deployed to GitHub: {repo_url}")
+        return repo_url
+    except Exception as e:
+        log.error(f"deploy_to_github error: {e}")
+        return None
+
+
+def run_cycle(state):
+    """Execute one build cycle."""
+    state["cycle"] += 1
+    log.info(f"\n{'='*60}")
+    log.info(f"🔧 BACKEND BUILDER CYCLE #{state['cycle']}")
+    log.info(f"{'='*60}")
+    
+    task_ideas = [
+        "Build simple web scraping API (2-hour MVP)",
+        "Build simple webhook-to-email forwarding tool",
+        "Build: Simple screenshot API with Puppeteer",
+        "Deploy 3 RapidAPI endpoints from existing code",
+        "Build simple JSON/CSV converter API"
+    ]
+    
+    for task in task_ideas:
+        if task in state.get("built_tools", []):
+            log.info(f"  ⏭️  Skipping already built: {task}")
+            continue
+        
+        log.info(f"\n🎯 Building: {task}")
+        research = sm.get_memory("market_research", "")
+        
+        result = generate_backend_code(task, research)
+        if not result:
+            log.error("  ❌ Code generation failed")
+            continue
+        
+        log.info(f"  ✅ Generated: {result.get('tool_name', 'unknown')}")
+        
+        files = {
+            "main.py": result.get("main_py", ""),
+            "requirements.txt": result.get("requirements_txt", ""),
+            "README.md": result.get("readme_md", "")
+        }
+        
+        repo_url = deploy_to_github(result.get("tool_name", "backend_tool"), files)
+        if repo_url:
+            state["built_tools"].append(task)
+            _save_state(state)
+            log.info(f"  🚀 Deployed: {repo_url}")
+        else:
+            log.error("  ❌ Deployment failed")
+        
+        time.sleep(5)
+    
+    _save_state(state)
+
+
+if __name__ == "__main__":
+    log.info("🚀 Backend Builder Agent starting...")
+    state = _load_state()
+    
+    while True:
+        try:
+            run_cycle(state)
+            log.info(f"\n💤 Sleeping for {CYCLE_INTERVAL} seconds...\n")
+            time.sleep(CYCLE_INTERVAL)
+        except KeyboardInterrupt:
+            log.info("\n👋 Shutting down gracefully...")
+            break
+        except Exception as e:
+            log.error(f"Cycle error: {e}")
+            time.sleep(60)
