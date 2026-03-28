@@ -1,35 +1,107 @@
-Each agent needs its own Railway worker service.
-Create 6 services in your Railway project, one per agent.
+================================================================
+  SAPRA COMPANY — DEPLOYMENT GUIDE
+  6 Railway services, fully autonomous
+================================================================
 
-For each service, set the start command to:
+RAILWAY SERVICES (create each with start command below):
+─────────────────────────────────────────────────────────
+  ceo-agent         →  python ceo.py
+  fixer-agent       →  python fixer.py
+  researcher-agent  →  python researcher.py
+  backend-builder   →  python builder_backend.py
+  frontend-builder  →  python builder_frontend.py
+  seller-team       →  python seller_combined.py
 
-CEO:
-  python ceo.py
+================================================================
+  ENVIRONMENT VARIABLES (set on ALL 6 services)
+================================================================
 
-DEEP RESEARCHER:
-  python researcher.py
+── REQUIRED (company won't start without these) ──────────────
 
-BACKEND BUILDER:
-  python builder_backend.py
+  ANTHROPIC_API_KEY       = sk-ant-...
+                            Your Anthropic API key
 
-FRONTEND BUILDER:
-  python builder_frontend.py
+  GOOGLE_SHEET_ID         = 1QROgA7CgWYSsHvNs_z93LuhRbwyAntiiwQEXPhp7gJo
+                            Shared memory bus for all agents
 
-B2B SELLER:
-  python seller_b2b.py
+  GOOGLE_CREDENTIALS      = { ... full service_account.json contents ... }
+                            Same as existing worker service
 
-FREELANCE SELLER:
-  python seller_freelance.py
+  GITHUB_TOKEN            = ghp_...
+                            Personal access token with repo + workflow permissions
+                            Get from: github.com → Settings → Developer settings
+                            → Personal access tokens → Tokens (classic)
 
-PRO FIXER:
-  python fixer.py
+  GITHUB_USERNAME         = salessapraindustry-ship-it
+                            Your GitHub username
 
-ALL services need these environment variables:
-  ANTHROPIC_API_KEY=your_key
-  GOOGLE_SHEET_ID=your_sheet_id
-  GOOGLE_CREDENTIALS=your_service_account_json
-  GITHUB_TOKEN=your_github_token
-  GITHUB_USERNAME=your_github_username
-  GITHUB_REPO=username/repo-name
-  SERPER_API_KEY=your_serper_key
-  RAPIDAPI_KEY=your_rapidapi_key (optional)
+  GITHUB_REPO             = salessapraindustry-ship-it/sapra-company
+                            This repository
+
+  SERPER_API_KEY          = f2ab1cc99a3ab23d472b14b40dbefa42c97ecbf6
+                            For Deep Researcher web searches
+
+── PAYMENTS (add these for autonomous money collection) ───────
+
+  LEMONSQUEEZY_KEY        = eyJ...
+                            Get from: app.lemonsqueezy.com → profile → API Keys
+                            → Add API Key → copy key
+
+  LEMONSQUEEZY_STORE_ID   = 123456
+                            Get from: app.lemonsqueezy.com/stores
+                            → click your store → copy ID from URL
+
+  GUMROAD_TOKEN           = ...
+                            Get from: gumroad.com/oauth/applications
+                            → Create application → Generate access token
+
+  CRYPTO_WALLET_USDT      = T...
+                            Your Pionex USDT TRC20 wallet address
+                            Get from: Pionex app → Wallet → Deposit → USDT → TRC20
+
+── OPTIONAL (improves functionality if added) ─────────────────
+
+  RAPIDAPI_KEY            = ab6e9f5d95msh43a64f103605c44p1a14edjsn524b07c43d47
+                            Your RapidAPI key (already known)
+
+  NOWPAYMENTS_KEY         = ...
+                            For automated crypto invoices
+                            Get from: nowpayments.io → API Keys
+
+================================================================
+  DEPLOY ORDER (important — do in this sequence)
+================================================================
+
+  1. ceo-agent         ← starts first, posts initial tasks
+  2. fixer-agent       ← must be live before others
+  3. researcher-agent  ← picks up CEO's research tasks
+  4. backend-builder   ← waits for research results
+  5. frontend-builder  ← works in parallel with backend
+  6. seller-team       ← starts selling once tools are built
+
+================================================================
+  WHAT TO WATCH IN GOOGLE SHEETS
+================================================================
+
+  Tasks tab          — all company tasks and their stages
+  Agent Status tab   — live heartbeat from each agent
+  Research tab       — Deep Researcher findings
+  Revenue tab        — every payment channel created + sales
+  Fixer Reports tab  — improvement history every 3 days
+
+================================================================
+  PAYMENT FLOW (fully autonomous)
+================================================================
+
+  Builder deploys tool
+    → payments.py creates LemonSqueezy subscription link
+    → payments.py creates Gumroad lifetime deal
+    → adds USDT crypto payment option
+    → B2B Seller lists on RapidAPI
+    → Frontend Builder embeds all links in landing page
+    → Freelance Seller sends proposals with portfolio links
+    → Customer pays via LemonSqueezy/Gumroad/Crypto
+    → Money goes to your bank (LemonSqueezy) or PayPal (Gumroad)
+    → CEO monitors revenue every 15 minutes via API
+
+================================================================
