@@ -22,6 +22,23 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+def _retry_api(fn, retries=3, delay=2):
+    """Retry any API call on failure."""
+    import time
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt < retries - 1:
+                import logging
+                logging.getLogger(__name__).warning(f'API retry {attempt+1}/{retries}: {e}')
+                time.sleep(delay)
+            else:
+                import logging
+                logging.getLogger(__name__).error(f'API failed after {retries} attempts: {e}')
+                return None
+
+
 # ── Config ────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CEO_MODEL         = "claude-sonnet-4-5"
@@ -88,7 +105,7 @@ YOUR TEAM:
 - DEEP_RESEARCHER: finds validated market opportunities, real buyer data, pricing benchmarks
 - BACKEND_BUILDER: builds APIs, automation tools, data pipelines, deploys to Railway/Render
 - FRONTEND_BUILDER: builds landing pages, dashboards, UIs that convert buyers
-- B2B_SELLER: lists tools on RapidAPI/AppSumo, sets up Stripe subscriptions, passive income
+- B2B_SELLER: lists tools on RapidAPI/AppSumo/LemonSqueezy/Gumroad, passive recurring income
 - FREELANCE_SELLER: bids on Toptal/Upwork high-ticket projects ($500-5000), LinkedIn outreach
 - PRO_FIXER: monitors all agents, fixes bugs, improves underperformers every 3 days
 
