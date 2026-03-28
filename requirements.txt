@@ -5,5 +5,4 @@ fastapi
 uvicorn
 anthropic
 gitpython
-playwright
 openpyxl
