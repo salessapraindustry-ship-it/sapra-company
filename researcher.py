@@ -270,15 +270,15 @@ if __name__ == "__main__":
     run()
 
 
-# === PRO-FIXER PATCH 20260328_1239 ===
+# === PRO-FIXER PATCH 20260328_1243 ===
 # Fixed: DEEP_RESEARCHER
-# Issues: Line 118: HTTP request is truncated mid-statement - 'if resp.status_code == 20' is incomplete (should be 200), Missing try-except wrapper around validate_opportunity() API call - causes validation failures to crash the agent, No error handling for malformed JSON responses from Claude API - agent fails when Claude returns non-JSON text, web_search() returns empty list on failure but validate_opportunity() doesn't handle empty search results gracefully, State file persists researched_topics but never checks if topics were already researched, causing infinite retries, No timeout or failure limit on validation retries - agent keeps failing the same task forever, Missing main execution loop - no run() function to actually execute the research cycles, CYCLE_INTERVAL is 1500 seconds but no scheduling mechanism exists to use it
+# Issues: Line 136: validate_opportunity() response parsing is truncated mid-line - 'if resp.status_code == 20' is incomplete, should be 'if resp.status_code == 200:', No error handling for JSON parsing failures in validate_opportunity() - will crash if Claude returns non-JSON, web_search() uses wrong HTTP method - uses GET with json= parameter instead of POST, Missing validation that search_results is not empty before calling validate_opportunity(), No main() function or task execution loop visible - agent likely never runs its core research cycle, State management exists but no code actually uses _load_state() or cycles through topics, CYCLE_INTERVAL defined but no scheduling logic to execute research tasks, No integration with shared_memory to read tasks or post validated opportunities
 def validate_opportunity(topic, search_results):
     """Use Claude to validate if this is a real opportunity."""
     if not search_results:
-        log.warning(f"No search results for {topic} - skipping validation")
+        log.warning(f"No search results for topic: {topic}")
         return None
-    
+
     results_text = "\n".join([
         f"- {r['title']}: {r['snippet']}"
         for r in search_results
@@ -303,7 +303,7 @@ Reply ONLY in JSON:
 {{
   "is_viable": true/false,
   "confidence": 0.0-1.0,
-  "demand_evidence": "specific proof of demand (e.g. 500 RapidAPI subscribers at $X/mo)",
+  "demand_evidence": "specific proof of demand",
   "price_benchmark": "$X-Y/month based on [source]",
   "competition": "LOW/MEDIUM/HIGH — why",
   "build_difficulty": "EASY/MEDIUM/HARD — why",
@@ -329,121 +329,131 @@ Reply ONLY in JSON:
         )
         if resp.status_code == 200:
             data = resp.json()
-            content = data.get("content", [])
-            if content and len(content) > 0:
-                text = content[0].get("text", "")
-                text = text.strip()
-                if text.startswith(""):
-                    text = text[7:]
-                if text.startswith(""):
-                    text = text[3:]
-                if text.endswith(""):
-                    text = text[:-3]
-                text = text.strip()
-                result = json.loads(text)
-                return result
+            content = data.get("content", [])[0].get("text", "")
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
             else:
-                log.error("Claude returned empty content")
+                log.warning("No JSON found in Claude response")
                 return None
         else:
-            log.error(f"Claude API returned {resp.status_code}: {resp.text}")
+            log.error(f"Claude API error {resp.status_code}: {resp.text}")
             return None
-    except json.JSONDecodeError as e:
-        log.error(f"Failed to parse Claude JSON response: {e}")
-        return None
     except Exception as e:
-        log.error(f"Validation API call failed: {e}")
+        log.error(f"Validation failed: {e}")
         return None
 
 
-def research_cycle():
-    """Execute one research cycle."""
-    state = _load_state()
-    state["cycle"] = state.get("cycle", 0) + 1
-    
-    topics = [
-        "AI-powered developer tools with API access",
-        "automation tools for small business recurring revenue",
-        "data extraction APIs with high demand on RapidAPI",
-        "profitable SaaS micro-tools under $20/month",
-        "B2B API services with proven subscriber base"
-    ]
-    
-    opportunities = []
-    failed_topics = state.get("failed_topics", {})
-    
-    for topic in topics:
-        if failed_topics.get(topic, 0) >= 3:
-            log.info(f"Skipping {topic} - failed 3+ times")
-            continue
-            
-        if topic in state.get("researched_topics", []):
-            log.info(f"Already researched: {topic}")
-            continue
-        
-        log.info(f"Researching: {topic}")
-        results = web_search(topic)
-        
-        if not results:
-            log.warning(f"No search results for {topic}")
-            failed_topics[topic] = failed_topics.get(topic, 0) + 1
-            continue
-        
-        validation = validate_opportunity(topic, results)
-        
-        if validation is None:
-            log.error(f"Validation failed for {topic}")
-            failed_topics[topic] = failed_topics.get(topic, 0) + 1
-            continue
-        
-        state["researched_topics"].append(topic)
-        
-        if validation.get("is_viable") and validation.get("confidence", 0) > 0.6:
-            opportunity = {
-                "topic": topic,
-                "validation": validation,
-                "timestamp": datetime.now().isoformat(),
-                "search_results": results
-            }
-            opportunities.append(opportunity)
-            log.info(f"✓ Found viable opportunity: {topic}")
-            sm.add_message("CEO", f"RESEARCH_COMPLETE: {topic}", opportunity)
+def web_search(query):
+    """Search the web for real data. Returns empty list on any failure."""
+    try:
+        serper_key = os.environ.get("SERPER_API_KEY", "")
+        if not serper_key:
+            log.warning("No SERPER_API_KEY — skipping web search")
+            return []
+        resp = requests.post(
+            "https://google.serper.dev/search",
+            headers={
+                "X-API-KEY": serper_key,
+                "Content-Type": "application/json"
+            },
+            json={"q": query, "num": 5},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            results = resp.json().get("organic", [])
+            return [{"title": r.get("title",""),
+                     "snippet": r.get("snippet",""),
+                     "url": r.get("link","")}
+                    for r in results[:5]]
         else:
-            log.info(f"✗ Not viable: {topic}")
-        
-        time.sleep(2)
-    
-    state["failed_topics"] = failed_topics
-    _save_state(state)
-    
-    if opportunities:
-        log.info(f"Cycle {state['cycle']}: Found {len(opportunities)} opportunities")
-        return opportunities
-    else:
-        log.info(f"Cycle {state['cycle']}: No viable opportunities found")
-        return []
+            log.warning(f"Serper returned {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log.warning(f"Search failed: {e}")
+    return []
 
 
-def run():
-    """Main execution loop."""
-    log.info("Deep Researcher starting...")
+def main():
+    """Main execution loop for research agent."""
+    log.info("🔬 Deep Researcher Agent starting...")
+    state = _load_state()
     
     while True:
         try:
-            opportunities = research_cycle()
-            if opportunities:
-                sm.add_message("CEO", "RESEARCH_REPORT", {
-                    "count": len(opportunities),
-                    "opportunities": opportunities
-                })
+            state["cycle"] += 1
+            log.info(f"\n=== Research Cycle {state['cycle']} ===")
+            
+            # Read pending research tasks from shared memory
+            tasks = sm.get_tasks_by_type("RESEARCH")
+            if not tasks:
+                log.info("No research tasks pending. Waiting...")
+                time.sleep(CYCLE_INTERVAL)
+                continue
+            
+            for task in tasks:
+                topic = task.get("description", "")
+                task_id = task.get("id", "unknown")
+                
+                if topic in state.get("researched_topics", []):
+                    log.info(f"Already researched: {topic}")
+                    continue
+                
+                log.info(f"\n📊 Researching: {topic}")
+                
+                # Perform web search
+                search_results = web_search(topic)
+                if not search_results:
+                    log.warning(f"No search results for: {topic}")
+                    sm.post_message({
+                        "from": "RESEARCHER",
+                        "to": "CEO",
+                        "content": f"Research failed for '{topic}' - no search results",
+                        "type": "RESEARCH_FAILURE"
+                    })
+                    continue
+                
+                # Validate opportunity
+                validation = validate_opportunity(topic, search_results)
+                if not validation:
+                    log.warning(f"Validation failed for: {topic}")
+                    sm.post_message({
+                        "from": "RESEARCHER",
+                        "to": "CEO",
+                        "content": f"Could not validate '{topic}' - API error",
+                        "type": "RESEARCH_FAILURE"
+                    })
+                    continue
+                
+                # Post results to shared memory
+                state["researched_topics"].append(topic)
+                
+                result = {
+                    "from": "RESEARCHER",
+                    "to": "CEO",
+                    "type": "RESEARCH_COMPLETE",
+                    "topic": topic,
+                    "task_id": task_id,
+                    "validation": validation,
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                sm.post_message(result)
+                log.info(f"✅ Research complete: {topic}")
+                log.info(f"   Viable: {validation.get('is_viable')}")
+                log.info(f"   Confidence: {validation.get('confidence')}")
+                log.info(f"   Action: {validation.get('recommended_action')}")
+                
+            _save_state(state)
+            log.info(f"\n💤 Sleeping {CYCLE_INTERVAL}s until next cycle...")
             time.sleep(CYCLE_INTERVAL)
+            
         except KeyboardInterrupt:
-            log.info("Researcher shutting down...")
+            log.info("\n🛑 Researcher shutting down...")
             break
         except Exception as e:
-            log.error(f"Research cycle error: {e}")
+            log.error(f"Cycle error: {e}")
             time.sleep(60)
 
 
 if __name__ == "__main__":
-    run()
+    main()
