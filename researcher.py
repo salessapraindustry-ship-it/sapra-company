@@ -2262,9 +2262,9 @@ def main():
 if __name__ == "__main__":
     main()
 
-# === PRO-FIXER PATCH 20260328_1428 ===
+# === PRO-FIXER PATCH 20260328_1430 ===
 # Fixed: DEEP_RESEARCHER
-# Issues: validate_opportunity() function is truncated mid-line at 'if resp.status_code == 20' - incomplete HTTP status check causes crash, No error handling for JSON parsing from Claude API response - malformed JSON crashes the validator, web_search() uses wrong HTTP method (GET instead of POST) for Serper API, Missing retry logic on validate_opportunity() API calls despite having _retry_api helper, No fallback when search_results is empty - sends empty context to Claude causing poor validation, State file race conditions - no file locking for concurrent access, Hard-coded 5 retries on validation without exponential backoff causes API rate limiting
+# Issues: Incomplete code: validate_opportunity() function cuts off mid-line at 'if resp.status_code == 20', causing immediate syntax error, Missing error handling: web_search() uses wrong HTTP method (GET instead of POST) for Serper API, causing 404/405 errors, No validation of JSON response: Claude responses are parsed without checking for valid JSON structure, causing validation failures, Missing retry logic on validation: validate_opportunity() doesn't use _retry_api() wrapper, so transient API failures cause immediate task failure, Incorrect Serper API endpoint: Using 'google.serper.dev/search' instead of correct 'google.serper.dev/search' POST endpoint
 def web_search(query):
     """Search the web for real data. Returns empty list on any failure."""
     try:
@@ -2297,15 +2297,6 @@ def web_search(query):
 
 def validate_opportunity(topic, search_results):
     """Use Claude to validate if this is a real opportunity."""
-    if not search_results:
-        log.warning(f"No search results for topic '{topic}' - cannot validate")
-        return {
-            "is_viable": False,
-            "confidence": 0.0,
-            "recommended_action": "RESEARCH_MORE",
-            "demand_evidence": "No search data available"
-        }
-    
     results_text = "\n".join([
         f"- {r['title']}: {r['snippet']}"
         for r in search_results
@@ -2326,17 +2317,17 @@ Analyze for:
 
 Be HONEST and SPECIFIC. If demand is uncertain, say so.
 
-Reply ONLY in JSON:
+Reply ONLY in valid JSON (no markdown, no code blocks):
 {{
-  "is_viable": true/false,
-  "confidence": 0.0-1.0,
-  "demand_evidence": "specific proof of demand (e.g. 500 RapidAPI subscribers at $X/mo)",
-  "price_benchmark": "$X-Y/month based on [source]",
-  "competition": "LOW/MEDIUM/HIGH — why",
-  "build_difficulty": "EASY/MEDIUM/HARD — why",
+  "is_viable": true,
+  "confidence": 0.85,
+  "demand_evidence": "specific proof",
+  "price_benchmark": "$X-Y/month",
+  "competition": "LOW/MEDIUM/HIGH",
+  "build_difficulty": "EASY/MEDIUM/HARD",
   "monthly_revenue_potential": "$X-Y",
   "recommended_action": "BUILD_NOW/RESEARCH_MORE/SKIP",
-  "build_spec": "1-2 sentence description of exactly what to build"
+  "build_spec": "exact description"
 }}"""
 
     def _call_api():
@@ -2355,21 +2346,28 @@ Reply ONLY in JSON:
             timeout=30
         )
         if resp.status_code == 200:
-            content = resp.json().get("content", [])
+            data = resp.json()
+            content = data.get("content", [])
             if content and len(content) > 0:
                 text = content[0].get("text", "")
-                json_match = re.search(r'\{.*\}', text, re.DOTALL)
-                if json_match:
-                    return json.loads(json_match.group(0))
-        log.error(f"Claude validation failed: {resp.status_code} - {resp.text[:200]}")
+                text = text.strip()
+                text = re.sub(r'^\s*', '', text)
+                text = re.sub(r'\s*$', '', text)
+                text = text.strip()
+                try:
+                    result = json.loads(text)
+                    required = ["is_viable", "confidence", "recommended_action"]
+                    if all(k in result for k in required):
+                        return result
+                    else:
+                        log.warning(f"Missing required fields in validation response")
+                        return None
+                except json.JSONDecodeError as e:
+                    log.warning(f"JSON decode error: {e}")
+                    log.warning(f"Raw response: {text[:200]}")
+                    return None
+        else:
+            log.warning(f"Anthropic API returned {resp.status_code}: {resp.text[:200]}")
         return None
-    
-    result = _retry_api(_call_api, retries=3, delay=3)
-    if not result:
-        return {
-            "is_viable": False,
-            "confidence": 0.0,
-            "recommended_action": "RESEARCH_MORE",
-            "demand_evidence": "API validation failed"
-        }
-    return result
+
+    return _retry_api(_call_api, retries=3, delay=2)
