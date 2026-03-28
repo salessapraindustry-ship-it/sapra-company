@@ -1508,3 +1508,146 @@ Reply ONLY in JSON:
             "recommended_action": "SKIP",
             "build_spec": ""
         }
+
+# === PRO-FIXER PATCH 20260328_1341 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: Line 128: Incomplete API response handling - code is truncated mid-line 'if resp.status_code == 20' (missing rest of condition), JSON validation logic missing - function returns validation results but never checks if JSON is valid before parsing, No error handling for malformed Claude responses - will crash on non-JSON responses, Missing retry logic on validate_opportunity() - most critical function has no fault tolerance, Web search returns empty list on failure but code doesn't validate search_results before passing to Claude, State persistence happens after validation but validation failures don't update 'researched_topics' - causes infinite retry loops, No timeout protection on main loop - CYCLE_INTERVAL is 1500s but no actual cycle enforcement, Missing shared_memory integration - imports sm but never uses it to coordinate with other agents
+def validate_opportunity(topic, search_results):
+    """Use Claude to validate if this is a real opportunity."""
+    if not search_results:
+        log.warning(f"No search results for '{topic}' - marking as researched but not viable")
+        return {"is_viable": False, "confidence": 0.0, "recommended_action": "SKIP", "demand_evidence": "No search results found"}
+    
+    results_text = "\n".join([
+        f"- {r['title']}: {r['snippet']}"
+        for r in search_results
+    ])
+
+    prompt = f"""You are a market researcher. Validate if this is a real money-making opportunity.
+
+TOPIC: {topic}
+SEARCH RESULTS:
+{results_text}
+
+Analyze for:
+1. Real buyer demand (people actively paying for this)
+2. Price benchmarks (what similar tools cost)
+3. Competition level (can we win?)
+4. Build difficulty (can an AI agent build this in 1-3 days?)
+5. Revenue potential (monthly recurring revenue possible?)
+
+Be HONEST and SPECIFIC. If demand is uncertain, say so.
+
+Reply ONLY in valid JSON:
+{{
+  "is_viable": true,
+  "confidence": 0.8,
+  "demand_evidence": "specific proof",
+  "price_benchmark": "$X-Y/month",
+  "competition": "LOW/MEDIUM/HIGH",
+  "build_difficulty": "EASY/MEDIUM/HARD",
+  "monthly_revenue_potential": "$X-Y",
+  "recommended_action": "BUILD_NOW",
+  "build_spec": "what to build"
+}}"""
+
+    def _call_claude():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": TOKENS,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if resp.status_code == 200:
+            content = resp.json().get("content", [])
+            if content and len(content) > 0:
+                text = content[0].get("text", "")
+                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+                else:
+                    return json.loads(text)
+        raise Exception(f"API returned {resp.status_code}")
+    
+    try:
+        result = _retry_api(_call_claude, retries=3, delay=2)
+        if result and isinstance(result, dict) and "is_viable" in result:
+            return result
+        else:
+            log.error(f"Invalid validation result for '{topic}'")
+            return {"is_viable": False, "confidence": 0.0, "recommended_action": "SKIP", "demand_evidence": "Validation failed"}
+    except Exception as e:
+        log.error(f"Validation exception for '{topic}': {e}")
+        return {"is_viable": False, "confidence": 0.0, "recommended_action": "SKIP", "demand_evidence": f"Error: {str(e)}"}
+
+
+def research_cycle():
+    """Run one research cycle."""
+    state = _load_state()
+    state["cycle"] += 1
+    log.info(f"🔬 Research Cycle {state['cycle']}")
+    
+    topics = [
+        "RapidAPI marketplace trending APIs",
+        "top selling APIs on API marketplaces 2024",
+        "profitable SaaS micro-tools under $50/mo",
+        "AI automation tools with paying customers",
+        "developer tools with monthly subscriptions"
+    ]
+    
+    for topic in topics:
+        if topic in state.get("researched_topics", []):
+            continue
+        
+        log.info(f"Researching: {topic}")
+        results = web_search(topic)
+        validation = validate_opportunity(topic, results)
+        
+        state["researched_topics"].append(topic)
+        
+        if validation.get("is_viable") and validation.get("confidence", 0) > 0.6:
+            log.info(f"✅ VIABLE: {topic}")
+            log.info(f"   Confidence: {validation.get('confidence')}")
+            log.info(f"   Action: {validation.get('recommended_action')}")
+            
+            sm.add_task({
+                "type": "research_finding",
+                "topic": topic,
+                "validation": validation,
+                "timestamp": datetime.now().isoformat()
+            })
+        else:
+            log.info(f"❌ NOT VIABLE: {topic} (confidence: {validation.get('confidence', 0)})")
+        
+        _save_state(state)
+        time.sleep(2)
+    
+    log.info(f"Cycle {state['cycle']} complete. Next cycle in {CYCLE_INTERVAL}s")
+
+
+def main():
+    """Main loop."""
+    log.info("🔬 Deep Researcher Agent starting...")
+    
+    while True:
+        try:
+            research_cycle()
+            time.sleep(CYCLE_INTERVAL)
+        except KeyboardInterrupt:
+            log.info("Researcher shutting down...")
+            break
+        except Exception as e:
+            log.error(f"Cycle error: {e}")
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()
