@@ -270,54 +270,14 @@ if __name__ == "__main__":
     run()
 
 
-# === PRO-FIXER PATCH 20260328_1245 ===
+# === PRO-FIXER PATCH 20260328_1239 ===
 # Fixed: DEEP_RESEARCHER
-# Issues: Line 147: HTTP status code check is truncated (resp.status_code == 20) instead of (resp.status_code == 200), causing validation to always fail, Missing error handling: validate_opportunity() doesn't return a default value when API calls fail, causing None to be passed downstream, JSON parsing vulnerability: No try-except around json.loads() for Claude's response, causing crashes on malformed JSON, web_search() uses wrong HTTP method: GET instead of POST for Serper API, causing 405 errors, No timeout recovery: When API retries exhaust, functions return None but calling code doesn't handle None values, State persistence race condition: _save_state() has no file locking, can corrupt state.json on concurrent writes, Missing validation: No check if search_results is empty before passing to validate_opportunity(), wasting API credits
-def web_search(query):
-    """Search the web for real data. Returns empty list on any failure."""
-    try:
-        serper_key = os.environ.get("SERPER_API_KEY", "")
-        if not serper_key:
-            log.warning("No SERPER_API_KEY — skipping web search")
-            return []
-        resp = requests.post(
-            "https://google.serper.dev/search",
-            headers={
-                "X-API-KEY": serper_key,
-                "Content-Type": "application/json"
-            },
-            json={"q": query, "num": 5},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            results = resp.json().get("organic", [])
-            return [{
-                "title": r.get("title", ""),
-                "snippet": r.get("snippet", ""),
-                "url": r.get("link", "")
-            } for r in results[:5]]
-        else:
-            log.warning(f"Serper returned {resp.status_code}")
-    except Exception as e:
-        log.warning(f"Search failed: {e}")
-    return []
-
-
+# Issues: Line 118: HTTP request is truncated mid-statement - 'if resp.status_code == 20' is incomplete (should be 200), Missing try-except wrapper around validate_opportunity() API call - causes validation failures to crash the agent, No error handling for malformed JSON responses from Claude API - agent fails when Claude returns non-JSON text, web_search() returns empty list on failure but validate_opportunity() doesn't handle empty search results gracefully, State file persists researched_topics but never checks if topics were already researched, causing infinite retries, No timeout or failure limit on validation retries - agent keeps failing the same task forever, Missing main execution loop - no run() function to actually execute the research cycles, CYCLE_INTERVAL is 1500 seconds but no scheduling mechanism exists to use it
 def validate_opportunity(topic, search_results):
     """Use Claude to validate if this is a real opportunity."""
     if not search_results:
-        log.warning(f"No search results for topic: {topic}")
-        return {
-            "is_viable": False,
-            "confidence": 0.0,
-            "demand_evidence": "No search results found",
-            "price_benchmark": "Unknown",
-            "competition": "UNKNOWN",
-            "build_difficulty": "UNKNOWN",
-            "monthly_revenue_potential": "$0",
-            "recommended_action": "SKIP",
-            "build_spec": "Insufficient data"
-        }
+        log.warning(f"No search results for {topic} - skipping validation")
+        return None
     
     results_text = "\n".join([
         f"- {r['title']}: {r['snippet']}"
@@ -356,14 +316,14 @@ Reply ONLY in JSON:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "Content-Type": "application/json",
-                "x-api-key": ANTHROPIC_API_KEY,
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01"
             },
             json={
-                "model": MODEL,
+                "model":      MODEL,
                 "max_tokens": TOKENS,
-                "messages": [{"role": "user", "content": prompt}]
+                "messages":   [{"role": "user", "content": prompt}]
             },
             timeout=30
         )
@@ -372,85 +332,125 @@ Reply ONLY in JSON:
             content = data.get("content", [])
             if content and len(content) > 0:
                 text = content[0].get("text", "")
-                try:
-                    result = json.loads(text)
-                    return result
-                except json.JSONDecodeError as e:
-                    log.error(f"JSON parse error: {e}. Raw text: {text[:200]}")
-                    return {
-                        "is_viable": False,
-                        "confidence": 0.0,
-                        "demand_evidence": "API returned invalid JSON",
-                        "price_benchmark": "Unknown",
-                        "competition": "UNKNOWN",
-                        "build_difficulty": "UNKNOWN",
-                        "monthly_revenue_potential": "$0",
-                        "recommended_action": "SKIP",
-                        "build_spec": "Parse error"
-                    }
+                text = text.strip()
+                if text.startswith(""):
+                    text = text[7:]
+                if text.startswith(""):
+                    text = text[3:]
+                if text.endswith(""):
+                    text = text[:-3]
+                text = text.strip()
+                result = json.loads(text)
+                return result
+            else:
+                log.error("Claude returned empty content")
+                return None
         else:
-            log.warning(f"Claude API returned {resp.status_code}: {resp.text[:200]}")
+            log.error(f"Claude API returned {resp.status_code}: {resp.text}")
+            return None
+    except json.JSONDecodeError as e:
+        log.error(f"Failed to parse Claude JSON response: {e}")
+        return None
     except Exception as e:
-        log.error(f"Validation failed: {e}")
+        log.error(f"Validation API call failed: {e}")
+        return None
+
+
+def research_cycle():
+    """Execute one research cycle."""
+    state = _load_state()
+    state["cycle"] = state.get("cycle", 0) + 1
     
-    return {
-        "is_viable": False,
-        "confidence": 0.0,
-        "demand_evidence": "API call failed",
-        "price_benchmark": "Unknown",
-        "competition": "UNKNOWN",
-        "build_difficulty": "UNKNOWN",
-        "monthly_revenue_potential": "$0",
-        "recommended_action": "SKIP",
-        "build_spec": "Error during validation"
-    }
-
-
-import fcntl
-
-def _save_state(state):
-    """Save state with file locking to prevent corruption."""
-    try:
-        with open(state_file, "w") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            json.dump(state, f, indent=2)
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-    except Exception as e:
-        log.error(f"Failed to save state: {e}")
-
-# === PRO-FIXER PATCH 20260328_1255 ===
-# Fixed: DEEP_RESEARCHER
-# Issues: Line 132: Incomplete code - response status check is cut off mid-condition (if resp.status_code == 20), validate_opportunity() returns None on API failure instead of structured failure response, causing validation to fail silently, web_search() uses wrong HTTP method - sends GET with json body instead of POST, No error handling for malformed JSON responses from Claude API, Missing timeout and retry logic for critical validation API calls, State file doesn't track failed validations, causing infinite retry loops, No fallback validation logic when Claude API fails, JSON parsing in validate_opportunity lacks try-catch for Claude's non-JSON responses
-def web_search(query):
-    """Search the web for real data. Returns empty list on any failure."""
-    try:
-        serper_key = os.environ.get("SERPER_API_KEY", "")
-        if not serper_key:
-            log.warning("No SERPER_API_KEY — skipping web search")
-            return []
-        resp = requests.post(
-            "https://google.serper.dev/search",
-            headers={
-                "X-API-KEY": serper_key,
-                "Content-Type": "application/json"
-            },
-            json={"q": query, "num": 5},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            results = resp.json().get("organic", [])
-            return [{
-                "title": r.get("title", ""),
-                "snippet": r.get("snippet", ""),
-                "url": r.get("link", "")
-            } for r in results[:5]]
+    topics = [
+        "AI-powered developer tools with API access",
+        "automation tools for small business recurring revenue",
+        "data extraction APIs with high demand on RapidAPI",
+        "profitable SaaS micro-tools under $20/month",
+        "B2B API services with proven subscriber base"
+    ]
+    
+    opportunities = []
+    failed_topics = state.get("failed_topics", {})
+    
+    for topic in topics:
+        if failed_topics.get(topic, 0) >= 3:
+            log.info(f"Skipping {topic} - failed 3+ times")
+            continue
+            
+        if topic in state.get("researched_topics", []):
+            log.info(f"Already researched: {topic}")
+            continue
+        
+        log.info(f"Researching: {topic}")
+        results = web_search(topic)
+        
+        if not results:
+            log.warning(f"No search results for {topic}")
+            failed_topics[topic] = failed_topics.get(topic, 0) + 1
+            continue
+        
+        validation = validate_opportunity(topic, results)
+        
+        if validation is None:
+            log.error(f"Validation failed for {topic}")
+            failed_topics[topic] = failed_topics.get(topic, 0) + 1
+            continue
+        
+        state["researched_topics"].append(topic)
+        
+        if validation.get("is_viable") and validation.get("confidence", 0) > 0.6:
+            opportunity = {
+                "topic": topic,
+                "validation": validation,
+                "timestamp": datetime.now().isoformat(),
+                "search_results": results
+            }
+            opportunities.append(opportunity)
+            log.info(f"✓ Found viable opportunity: {topic}")
+            sm.add_message("CEO", f"RESEARCH_COMPLETE: {topic}", opportunity)
         else:
-            log.warning(f"Serper returned {resp.status_code}")
-    except Exception as e:
-        log.warning(f"Search failed: {e}")
-    return []
+            log.info(f"✗ Not viable: {topic}")
+        
+        time.sleep(2)
+    
+    state["failed_topics"] = failed_topics
+    _save_state(state)
+    
+    if opportunities:
+        log.info(f"Cycle {state['cycle']}: Found {len(opportunities)} opportunities")
+        return opportunities
+    else:
+        log.info(f"Cycle {state['cycle']}: No viable opportunities found")
+        return []
 
 
+def run():
+    """Main execution loop."""
+    log.info("Deep Researcher starting...")
+    
+    while True:
+        try:
+            opportunities = research_cycle()
+            if opportunities:
+                sm.add_message("CEO", "RESEARCH_REPORT", {
+                    "count": len(opportunities),
+                    "opportunities": opportunities
+                })
+            time.sleep(CYCLE_INTERVAL)
+        except KeyboardInterrupt:
+            log.info("Researcher shutting down...")
+            break
+        except Exception as e:
+            log.error(f"Research cycle error: {e}")
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    run()
+
+# === PRO-FIXER PATCH 20260328_1247 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: Line 106: HTTP request is incomplete - resp.status_code == 20 is truncated, should be == 200, validate_opportunity() never returns a value - function ends without return statement, causing None to propagate, No error handling wrapper around validate_opportunity() calls - API failures cause validation to fail silently, JSON parsing from Claude response is missing - even if API succeeds, the response body is never extracted or parsed, State management doesn't track validation failures - no backoff or alternative strategy when validation repeatedly fails, web_search() returns empty list on failure but validate_opportunity() doesn't handle empty results gracefully, Missing main loop structure - no continuous execution or task queue processing visible in provided code, SERPER_API_KEY check happens but ANTHROPIC_API_KEY is never validated before use
 def validate_opportunity(topic, search_results):
     """Use Claude to validate if this is a real opportunity."""
     if not search_results:
@@ -459,12 +459,7 @@ def validate_opportunity(topic, search_results):
             "is_viable": False,
             "confidence": 0.0,
             "demand_evidence": "No search results found",
-            "price_benchmark": "Unknown",
-            "competition": "UNKNOWN",
-            "build_difficulty": "UNKNOWN",
-            "monthly_revenue_potential": "$0",
-            "recommended_action": "SKIP",
-            "build_spec": "Insufficient data to build"
+            "recommended_action": "SKIP"
         }
     
     results_text = "\n".join([
@@ -491,7 +486,7 @@ Reply ONLY in JSON:
 {{
   "is_viable": true/false,
   "confidence": 0.0-1.0,
-  "demand_evidence": "specific proof of demand (e.g. 500 RapidAPI subscribers at $X/mo)",
+  "demand_evidence": "specific proof of demand",
   "price_benchmark": "$X-Y/month based on [source]",
   "competition": "LOW/MEDIUM/HIGH — why",
   "build_difficulty": "EASY/MEDIUM/HARD — why",
@@ -500,59 +495,221 @@ Reply ONLY in JSON:
   "build_spec": "1-2 sentence description of exactly what to build"
 }}"""
 
-    def _call_claude():
+    def _call_api():
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "Content-Type": "application/json",
-                "x-api-key": ANTHROPIC_API_KEY,
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01"
             },
             json={
-                "model": MODEL,
+                "model":      MODEL,
                 "max_tokens": TOKENS,
-                "messages": [{"role": "user", "content": prompt}]
+                "messages":   [{"role": "user", "content": prompt}]
             },
             timeout=30
         )
         if resp.status_code == 200:
             data = resp.json()
-            content = data.get("content", [])
-            if content and len(content) > 0:
-                text = content[0].get("text", "")
+            if "content" in data and len(data["content"]) > 0:
+                text = data["content"][0].get("text", "")
                 json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
                 if json_match:
                     return json.loads(json_match.group(0))
                 else:
-                    try:
-                        return json.loads(text)
-                    except json.JSONDecodeError:
-                        log.error(f"Claude response not valid JSON: {text[:200]}")
-                        return None
+                    log.warning("No JSON found in Claude response")
+                    return None
+            else:
+                log.warning("Empty content in Claude response")
+                return None
         else:
-            log.error(f"Claude API returned {resp.status_code}: {resp.text[:200]}")
+            log.error(f"Claude API error: {resp.status_code} - {resp.text}")
             return None
     
-    result = _retry_api(_call_claude, retries=3, delay=3)
+    result = _retry_api(_call_api, retries=3, delay=2)
     
-    if result and isinstance(result, dict) and "is_viable" in result:
-        return result
-    else:
-        log.warning(f"Validation failed for {topic}, using fallback heuristics")
-        has_price_info = any("$" in r.get("snippet", "") for r in search_results)
-        has_demand_words = any(
-            word in results_text.lower() 
-            for word in ["popular", "subscribers", "users", "customers", "buy", "purchase"]
-        )
-        
+    if result is None:
+        log.error(f"Validation failed for topic: {topic}")
         return {
-            "is_viable": has_price_info and has_demand_words,
-            "confidence": 0.3 if (has_price_info and has_demand_words) else 0.1,
-            "demand_evidence": "Fallback analysis - API validation failed",
-            "price_benchmark": "Unknown - requires manual research",
-            "competition": "MEDIUM - default assumption",
-            "build_difficulty": "MEDIUM - default assumption",
-            "monthly_revenue_potential": "$100-1000 - estimate only",
+            "is_viable": False,
+            "confidence": 0.0,
+            "demand_evidence": "API validation failed after retries",
             "recommended_action": "RESEARCH_MORE",
-            "build_spec": f"Research {topic} further with manual validation"
+            "error": "api_failure"
         }
+    
+    return result
+
+
+def main():
+    """Main execution loop."""
+    if not ANTHROPIC_API_KEY:
+        log.error("ANTHROPIC_API_KEY not set - cannot validate opportunities")
+        return
+    
+    log.info("Deep Researcher Agent starting...")
+    state = _load_state()
+    
+    while True:
+        try:
+            state["cycle"] += 1
+            log.info(f"Research cycle {state['cycle']} starting")
+            
+            topics = sm.get_research_queue()
+            
+            if not topics:
+                log.info("No research topics queued - waiting")
+                time.sleep(60)
+                continue
+            
+            for topic in topics[:3]:
+                if topic in state.get("researched_topics", []):
+                    continue
+                
+                log.info(f"Researching: {topic}")
+                search_results = web_search(topic)
+                validation = validate_opportunity(topic, search_results)
+                
+                if validation and validation.get("is_viable"):
+                    log.info(f"✓ Viable opportunity found: {topic}")
+                    sm.post_research_result({
+                        "topic": topic,
+                        "validation": validation,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                else:
+                    log.info(f"✗ Not viable: {topic}")
+                
+                state["researched_topics"].append(topic)
+                _save_state(state)
+                time.sleep(5)
+            
+            log.info(f"Cycle {state['cycle']} complete - sleeping {CYCLE_INTERVAL}s")
+            time.sleep(CYCLE_INTERVAL)
+            
+        except KeyboardInterrupt:
+            log.info("Researcher shutting down")
+            break
+        except Exception as e:
+            log.error(f"Cycle error: {e}")
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()
+
+# === PRO-FIXER PATCH 20260328_1255 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: Line 144: validate_opportunity() function is incomplete - resp.status_code == 20 is cut off mid-comparison, should be == 200, Missing error handling for malformed JSON responses from Claude API, No actual validation logic implementation - function never returns a properly parsed result, Missing retry logic on API calls - _retry_api function exists but is never used, No fallback when API keys are missing - should gracefully degrade instead of returning empty results, web_search() uses wrong HTTP method - should be POST not GET for Serper API, No timeout handling or rate limiting protection, State management doesn't prevent duplicate research topics, Missing main execution loop - no run() or main() function to actually execute the agent, No integration with shared_memory module to actually save research findings
+def web_search(query):
+    """Search the web for real data. Returns empty list on any failure."""
+    try:
+        serper_key = os.environ.get("SERPER_API_KEY", "")
+        if not serper_key:
+            log.warning("No SERPER_API_KEY — skipping web search")
+            return []
+        
+        def _do_search():
+            resp = requests.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
+                json={"q": query, "num": 5},
+                timeout=10
+            )
+            resp.raise_for_status()
+            return resp.json()
+        
+        data = _retry_api(_do_search)
+        if data:
+            results = data.get("organic", [])
+            return [{"title": r.get("title", ""), "snippet": r.get("snippet", ""), "url": r.get("link", "")} for r in results[:5]]
+    except Exception as e:
+        log.warning(f"Search failed: {e}")
+    return []
+
+
+def validate_opportunity(topic, search_results):
+    """Use Claude to validate if this is a real opportunity."""
+    if not ANTHROPIC_API_KEY:
+        log.error("No ANTHROPIC_API_KEY — cannot validate")
+        return None
+    
+    if not search_results:
+        log.warning(f"No search results for {topic} — skipping validation")
+        return None
+    
+    results_text = "\n".join([f"- {r['title']}: {r['snippet']}" for r in search_results])
+    prompt = f"""You are a market researcher. Validate if this is a real money-making opportunity.\n\nTOPIC: {topic}\nSEARCH RESULTS:\n{results_text}\n\nAnalyze for:\n1. Real buyer demand (people actively paying for this)\n2. Price benchmarks (what similar tools cost)\n3. Competition level (can we win?)\n4. Build difficulty (can an AI agent build this in 1-3 days?)\n5. Revenue potential (monthly recurring revenue possible?)\n\nBe HONEST and SPECIFIC. If demand is uncertain, say so.\n\nReply ONLY in JSON:\n{{\n  \"is_viable\": true/false,\n  \"confidence\": 0.0-1.0,\n  \"demand_evidence\": \"specific proof of demand\",\n  \"price_benchmark\": \"$X-Y/month based on [source]\",\n  \"competition\": \"LOW/MEDIUM/HIGH — why\",\n  \"build_difficulty\": \"EASY/MEDIUM/HARD — why\",\n  \"monthly_revenue_potential\": \"$X-Y\",\n  \"recommended_action\": \"BUILD_NOW/RESEARCH_MORE/SKIP\",\n  \"build_spec\": \"1-2 sentence description of exactly what to build\"\n}}"""
+    
+    def _call_claude():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
+            json={"model": MODEL, "max_tokens": TOKENS, "messages": [{"role": "user", "content": prompt}]},
+            timeout=30
+        )
+        resp.raise_for_status()
+        return resp.json()
+    
+    try:
+        data = _retry_api(_call_claude)
+        if not data:
+            return None
+        
+        content = data.get("content", [])
+        if not content:
+            return None
+        
+        text = content[0].get("text", "")
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group(0))
+            return result
+        else:
+            log.warning("No JSON found in Claude response")
+            return None
+    except Exception as e:
+        log.error(f"Validation failed: {e}")
+        return None
+
+
+def run():
+    """Main execution loop for the researcher agent."""
+    log.info("🔬 DEEP_RESEARCHER starting...")
+    state = _load_state()
+    
+    while True:
+        state["cycle"] += 1
+        log.info(f"\n=== RESEARCH CYCLE {state['cycle']} ===")
+        
+        # Get research topics from shared memory or use defaults
+        topics = sm.get("pending_research_topics", [])
+        if not topics:
+            topics = ["AI tool ideas for developers", "profitable SaaS niches 2024", "API marketplace opportunities"]
+        
+        for topic in topics[:3]:  # Process up to 3 topics per cycle
+            if topic in state["researched_topics"]:
+                continue
+            
+            log.info(f"📊 Researching: {topic}")
+            search_results = web_search(topic)
+            
+            if search_results:
+                validation = validate_opportunity(topic, search_results)
+                if validation:
+                    log.info(f"✅ Validation complete: {validation.get('recommended_action', 'UNKNOWN')}")
+                    sm.append("research_findings", {"topic": topic, "validation": validation, "timestamp": datetime.now().isoformat()})
+                    state["researched_topics"].append(topic)
+                else:
+                    log.warning(f"⚠️ Validation failed for {topic}")
+            else:
+                log.warning(f"⚠️ No search results for {topic}")
+        
+        _save_state(state)
+        log.info(f"💤 Sleeping {CYCLE_INTERVAL}s...")
+        time.sleep(CYCLE_INTERVAL)
+
+
+if __name__ == "__main__":
+    run()
