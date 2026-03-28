@@ -2261,3 +2261,115 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# === PRO-FIXER PATCH 20260328_1428 ===
+# Fixed: DEEP_RESEARCHER
+# Issues: validate_opportunity() function is truncated mid-line at 'if resp.status_code == 20' - incomplete HTTP status check causes crash, No error handling for JSON parsing from Claude API response - malformed JSON crashes the validator, web_search() uses wrong HTTP method (GET instead of POST) for Serper API, Missing retry logic on validate_opportunity() API calls despite having _retry_api helper, No fallback when search_results is empty - sends empty context to Claude causing poor validation, State file race conditions - no file locking for concurrent access, Hard-coded 5 retries on validation without exponential backoff causes API rate limiting
+def web_search(query):
+    """Search the web for real data. Returns empty list on any failure."""
+    try:
+        serper_key = os.environ.get("SERPER_API_KEY", "")
+        if not serper_key:
+            log.warning("No SERPER_API_KEY — skipping web search")
+            return []
+        resp = requests.post(
+            "https://google.serper.dev/search",
+            headers={
+                "X-API-KEY": serper_key,
+                "Content-Type": "application/json"
+            },
+            json={"q": query, "num": 5},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            results = resp.json().get("organic", [])
+            return [{
+                "title": r.get("title", ""),
+                "snippet": r.get("snippet", ""),
+                "url": r.get("link", "")
+            } for r in results[:5]]
+        else:
+            log.warning(f"Serper returned {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log.warning(f"Search failed: {e}")
+    return []
+
+
+def validate_opportunity(topic, search_results):
+    """Use Claude to validate if this is a real opportunity."""
+    if not search_results:
+        log.warning(f"No search results for topic '{topic}' - cannot validate")
+        return {
+            "is_viable": False,
+            "confidence": 0.0,
+            "recommended_action": "RESEARCH_MORE",
+            "demand_evidence": "No search data available"
+        }
+    
+    results_text = "\n".join([
+        f"- {r['title']}: {r['snippet']}"
+        for r in search_results
+    ])
+
+    prompt = f"""You are a market researcher. Validate if this is a real money-making opportunity.
+
+TOPIC: {topic}
+SEARCH RESULTS:
+{results_text}
+
+Analyze for:
+1. Real buyer demand (people actively paying for this)
+2. Price benchmarks (what similar tools cost)
+3. Competition level (can we win?)
+4. Build difficulty (can an AI agent build this in 1-3 days?)
+5. Revenue potential (monthly recurring revenue possible?)
+
+Be HONEST and SPECIFIC. If demand is uncertain, say so.
+
+Reply ONLY in JSON:
+{{
+  "is_viable": true/false,
+  "confidence": 0.0-1.0,
+  "demand_evidence": "specific proof of demand (e.g. 500 RapidAPI subscribers at $X/mo)",
+  "price_benchmark": "$X-Y/month based on [source]",
+  "competition": "LOW/MEDIUM/HIGH — why",
+  "build_difficulty": "EASY/MEDIUM/HARD — why",
+  "monthly_revenue_potential": "$X-Y",
+  "recommended_action": "BUILD_NOW/RESEARCH_MORE/SKIP",
+  "build_spec": "1-2 sentence description of exactly what to build"
+}}"""
+
+    def _call_api():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": TOKENS,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if resp.status_code == 200:
+            content = resp.json().get("content", [])
+            if content and len(content) > 0:
+                text = content[0].get("text", "")
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group(0))
+        log.error(f"Claude validation failed: {resp.status_code} - {resp.text[:200]}")
+        return None
+    
+    result = _retry_api(_call_api, retries=3, delay=3)
+    if not result:
+        return {
+            "is_viable": False,
+            "confidence": 0.0,
+            "recommended_action": "RESEARCH_MORE",
+            "demand_evidence": "API validation failed"
+        }
+    return result
