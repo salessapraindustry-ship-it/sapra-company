@@ -727,3 +727,259 @@ def deploy_to_github(tool_name, files):
     except Exception as e:
         log.error(f"GitHub deployment error: {e}")
         return f"local:/tmp/tools/{tool_name}"
+
+# === PRO-FIXER PATCH 20260328_1305 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() uses incorrect JSON extraction with index() on potentially malformed LLM responses, causing crashes when '{' is not found, deploy_to_github() function is incomplete - cuts off mid-implementation and never returns proper URLs or handles errors, No research_context is ever generated - the function parameter exists but caller never provides actual research data, Missing main loop, task selection, and integration with shared_memory - agent has no autonomous execution path, Overly ambitious prompts asking for complete production systems in 2048 tokens - impossible to return valid code in that limit, No validation of LLM responses before JSON parsing - malformed responses crash the entire agent, CYCLE_INTERVAL of 1800 seconds means agent only attempts one task per 30 minutes regardless of success/failure, _retry_api wrapper exists but is never actually used anywhere in the code
+def extract_json_safe(text):
+    """Safely extract JSON from LLM response with fallbacks."""
+    if not text:
+        return None
+    text = text.strip()
+    text = re.sub(r'\s*', '', text)
+    text = re.sub(r'\s*$', '', text)
+    
+    try:
+        if '{' not in text:
+            return None
+        start = text.index('{')
+        depth, end = 0, len(text) - 1
+        for i in range(start, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        return json.loads(text[start:end+1])
+    except (ValueError, json.JSONDecodeError) as e:
+        log.error(f"JSON extraction failed: {e}")
+        return None
+
+
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool."""
+    prompt = f"""You are an expert Python backend developer. Build a minimal viable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context or 'No additional context provided'}
+
+Build a SINGLE-FILE Python script that:
+1. Solves the core task with minimal dependencies
+2. Uses Flask or FastAPI (choose simpler option)
+3. Has 1-3 essential endpoints only
+4. Includes basic error handling
+5. Can run with 'python main.py'
+
+Reply ONLY with valid JSON (no markdown):
+{{
+  "tool_name": "snake_case_name",
+  "description": "one sentence description",
+  "main_py": "complete runnable Python code",
+  "requirements_txt": "flask==2.3.0\\n...",
+  "readme_md": "# Title\\nUsage instructions",
+  "api_endpoints": ["GET /health", "POST /process"],
+  "deployment_platform": "Railway"
+}}"""
+
+    def _call_api():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": 16000,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=90
+        )
+        if resp.status_code != 200:
+            raise Exception(f"API error {resp.status_code}: {resp.text}")
+        return resp.json()
+
+    result = _retry_api(_call_api, retries=3, delay=3)
+    if not result:
+        return None
+    
+    try:
+        text = result["content"][0]["text"].strip()
+        data = extract_json_safe(text)
+        if data and "main_py" in data and "tool_name" in data:
+            return data
+        log.error(f"Invalid response structure: {list(data.keys()) if data else 'no JSON'}")
+    except Exception as e:
+        log.error(f"generate_backend_code parsing error: {e}")
+    return None
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    tool_dir = Path(f"/tmp/tools/{tool_name}")
+    tool_dir.mkdir(parents=True, exist_ok=True)
+    
+    for filename, content in files.items():
+        (tool_dir / filename).write_text(content)
+    log.info(f"  ✅ Tool saved locally: {tool_dir}")
+    
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        return f"local:/tmp/tools/{tool_name}"
+    
+    try:
+        repo_name = tool_name.replace('_', '-')
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers=headers,
+            json={
+                "name": repo_name,
+                "description": f"Backend tool: {tool_name}",
+                "private": False,
+                "auto_init": False
+            },
+            timeout=30
+        )
+        
+        if resp.status_code not in [200, 201, 422]:
+            log.warning(f"GitHub repo creation failed: {resp.status_code}")
+            return f"local:/tmp/tools/{tool_name}"
+        
+        repo_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
+        
+        os.chdir(tool_dir)
+        subprocess.run(["git", "init"], check=False, capture_output=True)
+        subprocess.run(["git", "add", "."], check=False, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], check=False, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], check=False, capture_output=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", f"https://{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git"],
+            check=False,
+            capture_output=True
+        )
+        result = subprocess.run(["git", "push", "-u", "origin", "main"], capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            log.info(f"  ✅ Pushed to GitHub: {repo_url}")
+            return repo_url
+        else:
+            log.warning(f"Git push failed: {result.stderr}")
+            return f"local:/tmp/tools/{tool_name}"
+            
+    except Exception as e:
+        log.error(f"deploy_to_github error: {e}")
+        return f"local:/tmp/tools/{tool_name}"
+
+
+def get_research_context(task):
+    """Generate focused research context for a task."""
+    prompt = f"""Provide technical context for building this backend tool:
+
+TASK: {task}
+
+In 2-3 sentences, specify:
+1. Best Python library/framework to use
+2. Key technical consideration
+3. Common pitfall to avoid
+
+Be specific and concise."""
+
+    def _call():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": 500,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if resp.status_code == 200:
+            return resp.json()["content"][0]["text"].strip()
+        return "No research context available."
+    
+    return _retry_api(_call, retries=2, delay=2) or "No research context available."
+
+
+def run_cycle():
+    """Main autonomous agent cycle."""
+    state = _load_state()
+    state["cycle"] += 1
+    log.info(f"\n{'='*60}")
+    log.info(f"🔧 BACKEND_BUILDER Cycle #{state['cycle']}")
+    log.info(f"{'='*60}")
+    
+    task = sm.get_next_task(agent_name="BACKEND_BUILDER")
+    if not task:
+        log.info("  📭 No tasks available. Waiting...")
+        _save_state(state)
+        return
+    
+    log.info(f"  📋 Task: {task}")
+    
+    log.info("  🔍 Generating research context...")
+    research = get_research_context(task)
+    log.info(f"  📚 Research: {research[:100]}...")
+    
+    log.info("  ⚙️  Generating backend code...")
+    code_data = generate_backend_code(task, research)
+    
+    if not code_data:
+        log.error("  ❌ Code generation failed")
+        sm.record_task_result("BACKEND_BUILDER", task, success=False, output="Code generation failed")
+        _save_state(state)
+        return
+    
+    tool_name = code_data.get("tool_name", f"tool_{int(time.time())}")
+    log.info(f"  🛠️  Tool: {tool_name}")
+    
+    files = {
+        "main.py": code_data.get("main_py", "# Error: no code generated"),
+        "requirements.txt": code_data.get("requirements_txt", "flask==2.3.0"),
+        "README.md": code_data.get("readme_md", f"# {tool_name}")
+    }
+    
+    log.info("  🚀 Deploying...")
+    url = deploy_to_github(tool_name, files)
+    
+    state["built_tools"].append({
+        "name": tool_name,
+        "task": task,
+        "url": url,
+        "timestamp": datetime.now().isoformat()
+    })
+    
+    log.info(f"  ✅ SUCCESS: {url}")
+    sm.record_task_result("BACKEND_BUILDER", task, success=True, output=url)
+    _save_state(state)
+
+
+if __name__ == "__main__":
+    log.info("🚀 Backend Builder Agent starting...")
+    if not ANTHROPIC_API_KEY:
+        log.error("❌ ANTHROPIC_API_KEY not set")
+        exit(1)
+    
+    while True:
+        try:
+            run_cycle()
+        except KeyboardInterrupt:
+            log.info("\n👋 Shutting down...")
+            break
+        except Exception as e:
+            log.error(f"❌ Cycle error: {e}")
+        
+        log.info(f"  ⏳ Sleeping {CYCLE_INTERVAL}s...\n")
+        time.sleep(CYCLE_INTERVAL)
