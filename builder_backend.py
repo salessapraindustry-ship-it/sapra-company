@@ -5103,3 +5103,312 @@ def deploy_to_github(tool_name, files):
     except Exception as e:
         log.error(f"deploy_to_github error: {e}")
         return None
+
+# === PRO-FIXER PATCH 20260328_1452 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() returns raw JSON but special characters (quotes, newlines) in Python code strings are not escaped, causing JSON parsing failures, deploy_to_github() function is incomplete - cuts off mid-request, preventing any deployment, No error handling for malformed JSON responses from Claude API - crashes on invalid JSON, Prompt asks Claude to return code in JSON strings but doesn't specify escape requirements, leading to broken JSON with unescaped quotes and newlines, No validation that generated code files are syntactically valid Python before deployment, Missing retry logic on Claude API calls despite having _retry_api helper function defined but never used, TOKENS=2048 is too low for generating complete backend applications with FastAPI code, requirements, and README
+#!/usr/bin/env python3
+# ================================================================
+#  builder_backend.py — Backend Builder Agent
+#  Builds APIs, automation tools, data pipelines
+#  Deploys to Railway/Render automatically
+# ================================================================
+
+import os
+import re
+import json
+import time
+import logging
+import requests
+import subprocess
+import ast
+from datetime import datetime
+from pathlib import Path
+
+import shared_memory as sm
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger(__name__)
+
+def _retry_api(fn, retries=3, delay=2):
+    """Retry any API call on failure."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt < retries - 1:
+                log.warning(f'API retry {attempt+1}/{retries}: {e}')
+                time.sleep(delay)
+            else:
+                log.error(f'API failed after {retries} attempts: {e}')
+                return None
+
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_USERNAME   = os.environ.get("GITHUB_USERNAME", "")
+MODEL             = "claude-haiku-4-5-20251001"
+TOKENS            = 16000  # Increased for complete code generation
+CYCLE_INTERVAL    = 1800   # 30 minutes
+
+state_file = "/tmp/backend_builder_state.json"
+
+
+def _load_state():
+    try:
+        with open(state_file) as f:
+            return json.load(f)
+    except Exception:
+        return {"cycle": 0, "built_tools": []}
+
+
+def _save_state(state):
+    try:
+        with open(state_file, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+
+def _extract_json_from_text(text):
+    """Robustly extract JSON from Claude response."""
+    # Remove markdown code blocks
+    text = re.sub(r"\s*", "", text)
+    text = re.sub(r"\s*", "", text)
+    text = text.strip()
+    
+    # Try to find JSON object
+    try:
+        start = text.index("{")
+        depth, end = 0, 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end > start:
+            return json.loads(text[start:end+1])
+    except (ValueError, json.JSONDecodeError) as e:
+        log.error(f"JSON extraction failed: {e}")
+        # Try entire text as JSON
+        try:
+            return json.loads(text)
+        except:
+            pass
+    return None
+
+
+def _validate_python_code(code):
+    """Check if Python code is syntactically valid."""
+    try:
+        ast.parse(code)
+        return True
+    except SyntaxError as e:
+        log.error(f"Invalid Python syntax: {e}")
+        return False
+
+
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+IMPORTANT: Return valid JSON only. Escape all special characters in code strings.
+Use \\n for newlines, \\" for quotes inside strings.
+
+Reply in JSON:
+{{
+  "tool_name": "snake_case_name",
+  "description": "what this tool does in 1 sentence",
+  "main_py": "complete main.py code with proper escaping",
+  "requirements_txt": "package1\\npackage2\\n...",
+  "readme_md": "markdown README with usage examples",
+  "api_endpoints": ["GET /endpoint1", "POST /endpoint2"],
+  "suggested_price": "$X/month",
+  "deployment_cmd": "railway up or render deploy command"
+}}"""
+
+    def _call_api():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": TOKENS,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=120
+        )
+        if resp.status_code == 200:
+            text = resp.json()["content"][0]["text"].strip()
+            result = _extract_json_from_text(text)
+            if result:
+                # Validate main_py if present
+                if "main_py" in result and result["main_py"]:
+                    if not _validate_python_code(result["main_py"]):
+                        log.warning("Generated Python code has syntax errors")
+                        return None
+                return result
+        return None
+
+    try:
+        return _retry_api(_call_api, retries=3, delay=3)
+    except Exception as e:
+        log.error(f"generate_backend_code error: {e}")
+    return None
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        # Save locally
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        log.info(f"  ✅ Tool saved locally: {tool_dir}")
+        return f"local:/tmp/tools/{tool_name}"
+
+    try:
+        # Create repo
+        repo_data = {
+            "name": tool_name,
+            "description": f"Auto-generated backend tool: {tool_name}",
+            "private": False,
+            "auto_init": True
+        }
+        resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json=repo_data,
+            timeout=30
+        )
+        
+        if resp.status_code not in [200, 201]:
+            log.error(f"GitHub repo creation failed: {resp.status_code} {resp.text}")
+            # Fall back to local save
+            tool_dir = Path(f"/tmp/tools/{tool_name}")
+            tool_dir.mkdir(parents=True, exist_ok=True)
+            for filename, content in files.items():
+                (tool_dir / filename).write_text(content)
+            return f"local:/tmp/tools/{tool_name}"
+        
+        repo_url = resp.json()["html_url"]
+        
+        # Upload files via GitHub API
+        for filename, content in files.items():
+            file_data = {
+                "message": f"Add {filename}",
+                "content": __import__('base64').b64encode(content.encode()).decode()
+            }
+            file_resp = requests.put(
+                f"https://api.github.com/repos/{GITHUB_USERNAME}/{tool_name}/contents/{filename}",
+                headers={
+                    "Authorization": f"token {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github.v3+json"
+                },
+                json=file_data,
+                timeout=30
+            )
+            if file_resp.status_code not in [200, 201]:
+                log.warning(f"Failed to upload {filename}: {file_resp.status_code}")
+        
+        log.info(f"  ✅ Tool deployed to GitHub: {repo_url}")
+        return repo_url
+        
+    except Exception as e:
+        log.error(f"deploy_to_github error: {e}")
+        # Fall back to local save
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        return f"local:/tmp/tools/{tool_name}"
+
+
+def run_cycle():
+    """Main agent cycle."""
+    state = _load_state()
+    state["cycle"] += 1
+    log.info(f"\n{'='*60}")
+    log.info(f"BACKEND BUILDER CYCLE {state['cycle']}")
+    log.info(f"{'='*60}")
+    
+    # Get task from shared memory
+    task = sm.get("backend_task", "Build a simple REST API for data conversion")
+    research = sm.get("research_context", "Use FastAPI framework with Python 3.9+")
+    
+    log.info(f"Task: {task}")
+    log.info(f"Research: {research[:100]}...")
+    
+    # Generate code
+    log.info("\nGenerating backend code...")
+    result = generate_backend_code(task, research)
+    
+    if result and "tool_name" in result and "main_py" in result:
+        tool_name = result["tool_name"]
+        log.info(f"✅ Generated: {tool_name}")
+        log.info(f"   Description: {result.get('description', 'N/A')}")
+        log.info(f"   Endpoints: {result.get('api_endpoints', [])}")
+        
+        # Prepare files
+        files = {
+            "main.py": result.get("main_py", ""),
+            "requirements.txt": result.get("requirements_txt", "fastapi\nuvicorn"),
+            "README.md": result.get("readme_md", f"# {tool_name}\n\nAuto-generated backend tool.")
+        }
+        
+        # Deploy
+        log.info("\nDeploying...")
+        deploy_url = deploy_to_github(tool_name, files)
+        
+        # Save state
+        state["built_tools"].append({
+            "name": tool_name,
+            "url": deploy_url,
+            "timestamp": datetime.now().isoformat(),
+            "description": result.get("description", "")
+        })
+        
+        sm.set(f"tool_{tool_name}", deploy_url)
+        log.info(f"\n✅ Cycle complete. Tool available at: {deploy_url}")
+    else:
+        log.error("❌ Code generation failed")
+    
+    _save_state(state)
+    return state
+
+
+if __name__ == "__main__":
+    log.info("Backend Builder Agent started")
+    while True:
+        try:
+            run_cycle()
+        except Exception as e:
+            log.error(f"Cycle error: {e}")
+        log.info(f"\nSleeping {CYCLE_INTERVAL}s...\n")
+        time.sleep(CYCLE_INTERVAL)
