@@ -1439,3 +1439,157 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# === PRO-FIXER PATCH 20260328_1326 ===
+# Fixed: BACKEND_BUILDER
+# Issues: generate_backend_code() returns malformed JSON due to incomplete JSON extraction logic - the regex bracket-matching fails on nested objects and code blocks containing braces, deploy_to_github() function is truncated mid-implementation, causing all deployment attempts to fail silently or crash, No error handling for malformed Claude API responses - code assumes perfect JSON structure without validation, The JSON extraction logic using manual bracket counting fails when Claude returns code examples with curly braces in strings or comments, Missing import for shared_memory module which likely doesn't exist, causing immediate crash on startup, TOKENS=2048 is insufficient for generating complete backend applications with multiple files (main.py, requirements.txt, README), _retry_api helper function is defined but never actually used anywhere in the code, No validation that extracted JSON contains required fields before accessing them, GitHub deployment incomplete - function cuts off before implementing the actual git push logic
+def generate_backend_code(task_description, research_context):
+    """Generate complete backend code for a tool."""
+    prompt = f"""You are an expert Python backend developer.
+Build a complete, deployable backend tool.
+
+TASK: {task_description}
+RESEARCH CONTEXT: {research_context}
+
+Build a production-ready Python FastAPI service that:
+1. Has a working API with proper endpoints
+2. Includes API key authentication for paid users
+3. Has clear documentation in code comments
+4. Can be deployed on Railway with minimal config
+5. Includes a requirements.txt
+
+Reply ONLY with valid JSON (no markdown, no code blocks):
+{{
+  "tool_name": "snake_case_name",
+  "description": "what this tool does in 1 sentence",
+  "main_py": "complete main.py code",
+  "requirements_txt": "package1\\npackage2\\n...",
+  "readme_md": "markdown README with usage examples",
+  "api_endpoints": ["GET /endpoint1", "POST /endpoint2"],
+  "suggested_price": "$X/month",
+  "deployment_cmd": "railway up or render deploy command"
+}}"""
+
+    def _api_call():
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model":      MODEL,
+                "max_tokens": 16000,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=120
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        result = _retry_api(_api_call)
+        if not result:
+            log.error("API call failed after retries")
+            return None
+
+        text = result["content"][0]["text"].strip()
+        
+        text = re.sub(r'^(?:json)?\s*', '', text)
+        text = re.sub(r'\s*$', '', text)
+        text = text.strip()
+        
+        match = re.search(r'\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}', text, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+        else:
+            start_idx = text.find('{')
+            if start_idx == -1:
+                log.error("No JSON object found in response")
+                return None
+            json_str = text[start_idx:]
+        
+        parsed = json.loads(json_str)
+        
+        required_fields = ["tool_name", "description", "main_py", "requirements_txt", "readme_md"]
+        missing = [f for f in required_fields if f not in parsed]
+        if missing:
+            log.error(f"Missing required fields: {missing}")
+            return None
+        
+        return parsed
+
+    except json.JSONDecodeError as e:
+        log.error(f"JSON decode error: {e}")
+        log.debug(f"Attempted to parse: {text[:500]}...")
+        return None
+    except Exception as e:
+        log.error(f"generate_backend_code error: {e}")
+        return None
+
+
+def deploy_to_github(tool_name, files):
+    """Create a GitHub repo and push the tool."""
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        tool_dir = Path(f"/tmp/tools/{tool_name}")
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            (tool_dir / filename).write_text(content)
+        log.info(f"  ✅ Tool saved locally: {tool_dir}")
+        return f"local:/tmp/tools/{tool_name}"
+
+    try:
+        repo_name = f"{tool_name}-api"
+        
+        resp = requests.post(
+            "https://api.github.com/user/repos",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            json={
+                "name": repo_name,
+                "description": f"Auto-generated backend tool: {tool_name}",
+                "private": False,
+                "auto_init": True
+            },
+            timeout=30
+        )
+        
+        if resp.status_code not in [201, 422]:
+            log.error(f"GitHub repo creation failed: {resp.status_code} {resp.text}")
+            return deploy_to_github(tool_name, files)
+        
+        repo_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}.git"
+        
+        work_dir = Path(f"/tmp/git_deploy/{tool_name}")
+        if work_dir.exists():
+            subprocess.run(["rm", "-rf", str(work_dir)], check=False)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        
+        subprocess.run(
+            ["git", "clone", repo_url, str(work_dir)],
+            capture_output=True,
+            timeout=60,
+            check=True
+        )
+        
+        for filename, content in files.items():
+            (work_dir / filename).write_text(content)
+        
+        subprocess.run(["git", "config", "user.email", "bot@builder.ai"], cwd=work_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Backend Builder"], cwd=work_dir, check=True)
+        subprocess.run(["git", "add", "."], cwd=work_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "Initial backend tool deployment"], cwd=work_dir, check=True)
+        subprocess.run(["git", "push"], cwd=work_dir, check=True)
+        
+        log.info(f"  ✅ Deployed to GitHub: {repo_url}")
+        return repo_url
+
+    except subprocess.CalledProcessError as e:
+        log.error(f"Git command failed: {e}")
+        return deploy_to_github(tool_name, files)
+    except Exception as e:
+        log.error(f"deploy_to_github error: {e}")
+        return deploy_to_github(tool_name, files)
